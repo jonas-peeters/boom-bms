@@ -60,6 +60,7 @@ trait ScalarOpConstants
   val CFI_BR   = 1.U(CFI_SZ.W) // Branch
   val CFI_JAL  = 2.U(CFI_SZ.W) // JAL
   val CFI_JALR = 3.U(CFI_SZ.W) // JALR
+  val CFI_BMS  = 4.U(CFI_SZ.W) // BMS = Branch on misspredict
 
   // PC Select Signal
   val PC_PLUS4 = 0.U(2.W)  // PC + 4
@@ -76,6 +77,7 @@ trait ScalarOpConstants
   val BR_LTU = 6.U(4.W)  // Branch on Less Than Unsigned
   val BR_J   = 7.U(4.W)  // Jump
   val BR_JR  = 8.U(4.W)  // Jump Register
+  val BR_BMS = 9.U(4.W)  // Branch on Misspeculation
 
   // RS1 Operand Select Signal
   val OP1_RS1 = 0.U(2.W) // Register Source #1
@@ -258,6 +260,12 @@ trait ScalarOpConstants
 
   val uopMOV       = 109.U(UOPC_SZ.W) // conditional mov decoded from "add rd, x0, rs2"
 
+  val uopBMS       = 110.U(UOPC_SZ.W) // branch when branch is mispredicted
+  val uopBJR       = 111.U(UOPC_SZ.W) // report branch result
+
+  val uopCZEROEQZ  = 112.U(UOPC_SZ.W) // conditional zeroing of a register
+  val uopCZERONEZ  = 113.U(UOPC_SZ.W) // conditional zeroing of a register
+
   // The Bubble Instruction (Machine generated NOP)
   // Insert (XOR x0,x0,x0) which is different from software compiler
   // generated NOPs which are (ADDI x0, x0, 0).
@@ -336,6 +344,43 @@ trait RISCVConstants
   def ComputeBranchTarget(pc: UInt, inst: UInt, xlen: Int)(implicit p: Parameters): UInt = {
     val b_imm32 = Cat(Fill(20,inst(31)), inst(7), inst(30,25), inst(11,8), 0.U(1.W))
     ((pc.asSInt + b_imm32.asSInt).asSInt & (-2).S).asUInt
+  }
+
+  def ComputeBMSTargetOffset(inst: UInt)(implicit p: Parameters): SInt = {
+    Cat(Fill(20,inst(23)), inst(22,12), 0.U(1.W)).asSInt
+  }
+
+  def ComputeBMSTarget(pc: UInt, inst: UInt, xlen: Int)(implicit p: Parameters): UInt = {
+    // The 23rd to 12th bit of the BMS instruction encode the relative offset of the target
+    val offset = ComputeBMSTargetOffset(inst)
+    ((pc.asSInt + offset).asSInt & (-2).S).asUInt
+  }
+
+  def ComputeBMSBranchOffset(inst: UInt)(implicit p: Parameters): SInt = {
+    Cat(Fill(24,inst(31)), inst(30,24), 0.U(1.W)).asSInt
+  }
+
+  def ComputeBMSBranch(pc: UInt, inst: UInt, xlen: Int)(implicit p: Parameters): UInt = {
+    val offset = ComputeBMSBranchOffset(inst)
+    ((pc.asSInt + offset).asSInt & (-2).S).asUInt
+  }
+
+  def ComputeBJROffset(inst: UInt)(implicit p: Parameters): SInt = {
+    Cat(Fill(20,inst(31)), inst(30,20), 0.U(1.W)).asSInt
+  }
+
+  def ComputeBJRBranch(pc: UInt, inst: UInt, xlen: Int)(implicit p: Parameters): UInt = {
+    val offset = ComputeBJROffset(inst)
+    ((pc.asSInt + offset).asSInt & (-2).S).asUInt
+  }
+
+  def ComputeBJRBranchTargetOffset(inst: UInt)(implicit p: Parameters): SInt = {
+    Cat(Fill(23,inst(14)), inst(13,7), 0.U(1.W)).asSInt
+  }
+
+  def ComputeBJRBranchTarget(pc: UInt, inst: UInt, xlen: Int)(implicit p: Parameters): UInt = {
+    val branch_target_offset = ComputeBJRBranchTargetOffset(inst)
+    ((pc.asSInt + branch_target_offset.asSInt).asSInt & (-2).S).asUInt
   }
 
   // Note: Accepts only EXPANDED rvc instructions

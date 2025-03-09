@@ -28,6 +28,8 @@ import freechips.rocketchip.rocket.{PipelinedMultiplier,BP,BreakpointUnit,Causes
 import boom.common._
 import boom.ifu._
 import boom.util._
+import freechips.rocketchip.rocket.Instructions.BJR
+import freechips.rocketchip.rocket.Instructions.ADDI
 
 /**t
  * Functional unit constants
@@ -119,6 +121,7 @@ class BrResolutionInfo(implicit p: Parameters) extends BoomBundle
 {
   val uop        = new MicroOp
   val valid      = Bool()
+  val bjr_valid  = Bool()
   val mispredict = Bool()
   val taken      = Bool()                     // which direction did the branch go?
   val cfi_type   = UInt(CFI_SZ.W)
@@ -128,6 +131,18 @@ class BrResolutionInfo(implicit p: Parameters) extends BoomBundle
 
   val jalr_target = UInt(vaddrBitsExtended.W)
   val target_offset = SInt()
+}
+
+class BjrInfo(implicit p: Parameters) extends BoomBundle
+{
+  val valid           = Bool()
+  val taken           = Bool()                     // which direction did the branch go?
+
+  val branch_cfi_idx  = UInt(log2Ceil(fetchWidth).W)
+  val branch_pc       = UInt(vaddrBitsExtended.W)
+  val branch_block_pc = UInt(vaddrBitsExtended.W)
+
+  val target_pc       = UInt(vaddrBitsExtended.W)
 }
 
 class BrUpdateInfo(implicit p: Parameters) extends BoomBundle
@@ -185,8 +200,14 @@ abstract class FunctionalUnit(
     val bp = if (isMemAddrCalcUnit) Input(Vec(nBreakpoints, new BP)) else null
     val mcontext = if (isMemAddrCalcUnit) Input(UInt(coreParams.mcontextWidth.W)) else null
     val scontext = if (isMemAddrCalcUnit) Input(UInt(coreParams.scontextWidth.W)) else null
-
+    val bmhu = Output(Valid(new BranchMissHistoryUpdate))
+    val bjrinfo = Output(new BjrInfo)
   })
+
+  io.bmhu.valid := false.B
+  io.bmhu.bits := DontCare
+  io.bjrinfo := DontCare
+  io.bjrinfo.valid := false.B
 
   io.bypass.foreach { b => b.valid := false.B; b.bits := DontCare }
 
@@ -355,7 +376,9 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
                         BR_LT  -> Mux( br_lt,  PC_BRJMP, PC_PLUS4),
                         BR_LTU -> Mux( br_ltu, PC_BRJMP, PC_PLUS4),
                         BR_J   -> PC_BRJMP,
-                        BR_JR  -> PC_JALR
+                        BR_JR  -> PC_JALR,
+                        // We always take the predicted path for BMS instructions
+                        BR_BMS -> Mux(uop.taken, PC_BRJMP, PC_PLUS4),
                         ))
 
   val is_taken = io.req.valid &&
@@ -369,6 +392,8 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   val is_br          = io.req.valid && !killed && uop.is_br && !uop.is_sfb
   val is_jal         = io.req.valid && !killed && uop.is_jal
   val is_jalr        = io.req.valid && !killed && uop.is_jalr
+  val is_bms         = io.req.valid && !killed && uop.is_bms
+  val is_bjr         = io.req.valid && !killed && uop.inst === BJR
 
   when (is_br || is_jalr) {
     if (!isJmpUnit) {
@@ -380,17 +405,25 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     when (pc_sel === PC_BRJMP) {
       mispredict := !uop.taken
     }
+
+    when (mispredict) {
+        printf("Mispredict @ %x (%x)\n", uop.debug_pc, uop.inst)
+    }
+    when (!mispredict) {
+        printf("Correct prediction @ %x (%x)\n", uop.debug_pc, uop.inst)
+    }
   }
 
   val brinfo = Wire(new BrResolutionInfo)
 
   // note: jal doesn't allocate a branch-mask, so don't clear a br-mask bit
   brinfo.valid          := is_br || is_jalr
+  brinfo.bjr_valid      := is_bjr
   brinfo.mispredict     := mispredict
   brinfo.uop            := uop
   brinfo.cfi_type       := Mux(is_jalr, CFI_JALR,
                            Mux(is_br  , CFI_BR, CFI_X))
-  brinfo.taken          := is_taken
+  brinfo.taken          := Mux(is_bjr, rs1, is_taken)
   brinfo.pc_sel         := pc_sel
 
   brinfo.jalr_target    := DontCare
@@ -399,7 +432,10 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   // Branch/Jump Target Calculation
   // For jumps we read the FTQ, and can calculate the target
   // For branches we emit the offset for the core to redirect if necessary
-  val target_offset = imm_xprlen(20,0).asSInt
+  val bms_target_offset = ComputeBMSTargetOffset(uop.inst)
+  val bjr_target_offset = ComputeBJROffset(uop.inst)
+  val target_offset = Mux(is_bms, bms_target_offset, 
+                      Mux(is_bjr, bjr_target_offset, imm_xprlen(20,0).asSInt))
   brinfo.jalr_target := DontCare
   if (isJmpUnit) {
     def encodeVirtualAddress(a0: UInt, ea: UInt) = if (vaddrBitsExtended == vaddrBits) {
@@ -427,13 +463,71 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
                     !io.get_ftq_pc.entry.cfi_idx.valid ||
                     (io.get_ftq_pc.entry.cfi_idx.bits =/= cfi_idx)
     }
+
+    //when (is_bms) {
+    //  printf("Functional unit is handling a BMS instruction:\n")
+    //  printf("   would have been taken: %d\n", uop.taken)
+    //  printf("   target_offset: %d\n", target_offset)
+    //  printf("   target: %d\n", jalr_target)
+    //}
   }
 
   brinfo.target_offset := target_offset
 
+  //when (is_bms) {
+  //  printf("Functional unit is handling a BMS instruction:\n")
+  //  printf("   taken prediction: %d\n", uop.taken)
+  //  printf("   pc_sel: %d\n", pc_sel)
+  //  printf("   target_offset: %d\n", target_offset)
+  //}
 
   io.brinfo := brinfo
 
+  if (isJmpUnit) {
+    val block_pc = AlignPCToBoundary(io.get_ftq_pc.pc, icBlockBytes)
+    val uop_pc = (block_pc | uop.pc_lob) - Mux(uop.edge_inst, 2.U, 0.U)
+    
+    io.bmhu.valid := brinfo.valid
+    io.bmhu.bits.mispredict := brinfo.mispredict
+    io.bmhu.bits.pc := uop_pc
+    //val uop_pc_next = RegNext(uop_pc)
+    //val uop_pc_next_next = RegNext(RegNext(uop_pc))
+    //val uop_pc_next_next_next = RegNext(RegNext(RegNext(uop_pc)))
+    //when (brinfo.valid) {
+    //  printf("Setting bmhu.valid\n")
+    //  printf("  mispredict: %b\n", brinfo.mispredict)
+    //  printf("  uop_pc: 0x%x\n", uop_pc)
+    //  printf("  uop_pc_next: 0x%x\n", uop_pc_next)
+    //  printf("  uop_pc_next_next: 0x%x\n", uop_pc_next_next)
+    //  printf("  uop_pc_next_next_next: 0x%x\n", uop_pc_next_next_next)
+    //}
+  }
+
+
+  val bjrinfo = Wire(new BjrInfo)
+  bjrinfo.valid := is_bjr
+  bjrinfo.taken := rs1
+
+  val bjr_block_pc = AlignPCToBoundary(io.get_ftq_pc.pc, icBlockBytes)
+  val bjr_pc = (bjr_block_pc | uop.pc_lob) - Mux(uop.edge_inst, 2.U, 0.U)
+
+  val branch_pc = ComputeBJRBranch(bjr_pc, uop.inst, xLen)
+  bjrinfo.branch_pc := branch_pc
+  val branch_block_pc = AlignPCToBoundary(branch_pc, icBlockBytes)
+  bjrinfo.branch_block_pc := branch_block_pc
+
+  val branch_bank = bank(branch_pc)
+  val branch_pc_lob = branch_pc//bankAlign(branch_pc) + (branch_bank.asUInt * bankBytes.U)
+  val branch_cfi_idx = ((branch_pc_lob ^ Mux(branch_bank === 1.U, 1.U << log2Ceil(bankBytes), 0.U)))(log2Ceil(fetchWidth),1)
+  bjrinfo.branch_cfi_idx := branch_cfi_idx
+
+  when (is_bjr) {
+    printf("Calculated branch_cfi_idx of %d with the following parameters:\n\tbranch_pc: %x\n\tbranch_block_pc: %x\n\tbranch_bank: %d\n\tbranch_pc_lob: %x\n\tbankBytes: %d\n\tfetchWidth: %d\n", branch_cfi_idx, branch_pc, branch_block_pc, branch_bank, branch_pc_lob, bankBytes.U, fetchWidth.U)
+  }
+
+  val target_pc = ComputeBJRBranchTarget(bjr_pc, uop.inst, xLen)
+  bjrinfo.target_pc := Mux(rs1 === true.B, target_pc, branch_pc + 4.U)
+  io.bjrinfo := bjrinfo
 
 
 // Response

@@ -27,6 +27,9 @@ import freechips.rocketchip.util.property._
 import boom.common._
 import boom.exu.{CommitExceptionSignals, BranchDecode, BrUpdateInfo, BranchDecodeSignals}
 import boom.util._
+import boom.exu.BrResolutionInfo
+import boom.exu.BjrInfo
+import freechips.rocketchip.rocket.Instructions.BMS
 
 
 class FrontendResp(implicit p: Parameters) extends BoomBundle()(p) {
@@ -250,6 +253,155 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
 }
 
 
+class BranchMissHistoryEntry(implicit p: Parameters) extends BoomBundle {
+  // The PC of the branch, not the BMS instruction
+  val pc = UInt(vaddrBitsExtended.W)
+  // History of mispredictions for this branch
+  val mispredictionHistory = UInt(branchMissHistoryLength)
+  // If the history has been filled up to this point
+  val valid = UInt(branchMissHistoryLength)
+}
+
+class BrachMissHistoryPrediction(implicit p: Parameters) extends BoomBundle {
+  val pc = UInt(vaddrBitsExtended.W)
+  val prediction = Bool()
+}
+
+class BranchMissHistoryUpdate(implicit p: Parameters) extends BoomBundle {
+  val pc = UInt(vaddrBitsExtended.W)
+  val mispredict = Bool()
+}
+
+class BJRInfo(implicit p: Parameters) extends BoomBundle {
+  val pc = UInt(vaddrBitsExtended.W)
+  val mispredict = Bool()
+}
+
+class BranchMissHistoryRequest(implicit p: Parameters) extends BoomBundle {
+  val pc = UInt(vaddrBitsExtended.W)
+  val modifier = UInt(5.W)
+}
+
+class BranchMissHistory(implicit p: Parameters) extends BoomModule()(p)
+ with HasBoomFrontendParameters {
+  // Number of different branches to track
+  // Must be a power of 2
+  var tableSize = 128
+
+  val io = IO(new Bundle {
+    val updates = Input(Vec(coreWidth * 2, Valid(new BranchMissHistoryUpdate)))
+    val req0 = Input(new BranchMissHistoryRequest)
+    val req1 = Input(new BranchMissHistoryRequest)
+    val resp0 = Output(Valid(new Bool))
+    val resp1 = Output(Valid(new Bool))
+  })
+
+  def calcIndex(pc: UInt): UInt = {
+    // Use the lower bits of the PC to index into the table
+    // Because the pc is always aligned to 2 bytes, we can ignore the lower bit
+    (pc >> 1.U) & (tableSize - 1).U
+  }
+
+  val history = Reg(Vec(tableSize, new BranchMissHistoryEntry))
+
+  for (update <- io.updates) {
+    when (update.valid) {
+      val index = calcIndex(update.bits.pc)
+      when (history(index).pc === update.bits.pc) {
+        // If the entry is for the same PC, update the taken history, and mark the history as valid
+        history(index).mispredictionHistory := history(index).mispredictionHistory * 2.U + update.bits.mispredict
+        history(index).valid := history(index).valid * 2.U + 1.U
+        //printf("Updating BranchMissHistory Taken: %x %b %b\n", 
+        //  update.bits.pc, 
+        //  history(index).mispredictionHistory * 2.U + update.bits.mispredict, 
+        //  history(index).valid * 2.U + 1.U)
+      }.otherwise {
+        history(index).pc := update.bits.pc
+        history(index).mispredictionHistory := 0.U(branchMissHistoryLength) + update.bits.mispredict
+        history(index).valid := 1.U(branchMissHistoryLength)
+        //printf("Initializing BranchMissHistory Taken: %x %b %b\n", 
+        //  update.bits.pc, 
+        //  0.U(branchMissHistoryLength) + update.bits.mispredict, 
+        //  1.U(branchMissHistoryLength))
+      }
+    }
+  }
+  
+  def checkPrediction(entry: BranchMissHistoryEntry, req: BranchMissHistoryRequest): Bool = {
+    val successfulPredictions = PopCount((~entry.mispredictionHistory) & entry.valid)
+    val totalPredictions = PopCount(entry.valid)
+
+    val threshold = 36.U + req.modifier * 2.U
+    (successfulPredictions * 100.U) / totalPredictions <= threshold
+  }
+
+  val index0 = calcIndex(io.req0.pc)
+  val entry0 = history(index0)
+  io.resp0.valid := false.B
+  io.resp0.bits := false.B
+  when(entry0.pc === io.req0.pc && PopCount(entry0.valid) > 0.U) {
+    io.resp0.valid := entry0.pc === io.req0.pc
+    io.resp0.bits := checkPrediction(entry0, io.req0)
+    printf("Reading BranchMissHistory 0: %x %b %b %b\n", io.req0.pc, entry0.mispredictionHistory, entry0.valid, checkPrediction(entry0, io.req0))
+  }
+
+  val index1 = calcIndex(io.req1.pc)
+  val entry1 = history(index1)
+  io.resp1.valid := false.B
+  io.resp1.bits := false.B
+  when(entry1.pc === io.req1.pc && PopCount(entry1.valid) > 0.U) {
+    io.resp1.valid := entry1.pc === io.req1.pc
+    io.resp1.bits := checkPrediction(entry1, io.req1)
+    printf("Reading BranchMissHistory 0: %x %b %b %b\n", io.req1.pc, entry1.mispredictionHistory, entry1.valid, checkPrediction(entry1, io.req1))
+  }
+}
+
+class MultiSourceQueue[T <: Data](
+    val dataType: T,
+    val numSources: Int,
+    val entriesPerSource: Int
+) extends Module {
+    val io = IO(new Bundle {
+        val enq = Vec(
+          numSources,
+          Flipped(Valid(dataType))
+        ) // Each producer connects to enq(i)
+        val deq = Valid(dataType) // Single output for dequeued data
+    })
+
+    // Create individual queues for each source
+    val queues = VecInit(Seq.fill(numSources)(Module(new Queue(dataType, entriesPerSource)).io))
+
+    // Connect each source to its respective queue's input
+    for (i <- 0 until numSources) {
+        queues(i).enq.valid := io.enq(i).valid
+        when(io.enq(i).valid) {
+            queues(i).enq.bits := io.enq(i).bits
+        }.otherwise {
+            queues(i).enq.bits := DontCare
+        }
+        queues(i).deq.ready := false.B
+    }
+
+    val selection = Wire(UInt(log2Ceil(numSources + 1).W))
+    selection := numSources.asUInt
+    
+
+    for (i <- numSources - 1 to 0 by -1) {
+        when(queues(i).deq.valid) {
+            selection := i.asUInt
+        }
+    }
+    
+    io.deq.valid := queues(selection).deq.valid
+    when (selection === numSources.asUInt) {
+        io.deq.bits := 0.U.asTypeOf(dataType)
+    }.otherwise {
+        io.deq.bits := queues(selection).deq.bits
+        queues(selection).deq.ready := true.B
+    }
+}
+
 
 /**
  * IO for the BOOM Frontend to/from the CPU
@@ -286,6 +438,9 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val flush_icache = Output(Bool())
 
   val perf = Input(new FrontendPerfEvents)
+
+  val bmhu = Output(Vec(coreWidth, Valid(new BranchMissHistoryUpdate)))
+  val bjrinfos = Output(Vec(coreWidth, new BjrInfo))
 }
 
 /**
@@ -331,6 +486,15 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   val bpd = Module(new BranchPredictor)
   bpd.io.f3_fire := false.B
+  val bmh = Module(new BranchMissHistory)
+  for (i <- 0 until coreWidth) {
+    bmh.io.updates(i) := io.cpu.bmhu(i)
+  }
+  bmh.io.updates(coreWidth) := DontCare
+  bmh.io.req0 := DontCare
+  bmh.io.req1 := DontCare
+
+
   val ras = Module(new BoomRAS)
 
   val icache = outer.icache.module
@@ -356,8 +520,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s0_replay_ppc  = Wire(UInt())
   val s0_s1_use_f3_bpd_resp = WireInit(false.B)
 
-
-
+  //printf("s0_ghist start: %b %b %b %b\n", s0_ghist.old_history, s0_ghist.current_saw_branch_not_taken, s0_ghist.new_saw_branch_not_taken, s0_ghist.new_saw_branch_taken)
 
   when (RegNext(reset.asBool) && !reset.asBool) {
     s0_valid   := true.B
@@ -372,6 +535,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.f0_req.valid      := s0_valid
   bpd.io.f0_req.bits.pc    := s0_vpc
   bpd.io.f0_req.bits.ghist := s0_ghist
+
+  when (s0_valid) {
+  }
 
   // --------------------------------------------------------
   // **** ICache Access (F1) ****
@@ -431,6 +597,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_tsrc      := BSRC_1
     s0_vpc       := f1_predicted_target
     s0_ghist     := f1_predicted_ghist
+    //printf("Updating ghist: f1_predicted_ghist\n")
     s0_is_replay := false.B
   }
 
@@ -487,6 +654,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     // When this is not a replay (it queried the BPDs, we should use f3 resp in the replaying s1)
     s0_s1_use_f3_bpd_resp := !s2_is_replay
     s0_ghist := s2_ghist
+    //printf("Updating ghist: s2_ghist\n")
     s0_tsrc  := s2_tsrc
     f1_clear := true.B
   } .elsewhen (s2_valid && f3_ready) {
@@ -501,6 +669,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       s0_vpc       := f2_predicted_target
       s0_is_replay := false.B
       s0_ghist     := f2_predicted_ghist
+      //printf("Updating ghist: f2_predicted_ghist\n")
       s2_fsrc      := BSRC_2
       s0_tsrc      := BSRC_2
     }
@@ -623,9 +792,29 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
         val bpd_decoder0 = Module(new BranchDecode)
         bpd_decoder0.io.inst := exp_inst0
         bpd_decoder0.io.pc   := pc0
+        when (exp_inst0 === BMS) {
+          val bms_branch0 = ComputeBMSBranch(pc0, exp_inst0, xLen)
+          bmh.io.req0.pc := bms_branch0
+          bmh.io.req0.modifier := exp_inst0(11, 7)
+          //printf("BranchMissHistoryRequest0: pc: %x, branch %x, modifier %x\n", pc0, bms_branch0, exp_inst0(11, 7))
+        }
+
         val bpd_decoder1 = Module(new BranchDecode)
         bpd_decoder1.io.inst := exp_inst1
         bpd_decoder1.io.pc   := pc1
+        when (exp_inst1 === BMS) {
+          val bms_branch1 = ComputeBMSBranch(pc1, exp_inst1, xLen)
+          bmh.io.req1.pc := bms_branch1
+          bmh.io.req1.modifier := exp_inst1(11, 7)
+          //printf("BranchMissHistoryRequest1: pc: %x, branch %x, modifier %x\n", pc1, bms_branch1, exp_inst1(11, 7))
+        }
+        //when(exp_inst0(6, 0) === 11.U || exp_inst1(6, 0) === 11.U) {
+        //  printf("w: %d\n", w.U)
+        //  printf("Bank Data: %x\n", bank_data)
+        //  printf("F3 Data: %x\n", f3_data)
+        //  printf("inst0: %x\t%x\n", inst0, exp_inst0)
+        //  printf("inst1: %x\t%x\n", inst1, exp_inst1)
+        //}
 
         when (bank_prev_is_half) {
           bank_insts(w)                := inst0
@@ -682,6 +871,17 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
           inst  := bank_data(w*16+32-1,w*16)
           valid := !(bank_mask(w-1) && !isRVC(bank_insts(w-1)))
         }
+
+        when(exp_inst === BMS) {
+          val bms_branch = ComputeBMSBranch(pc, exp_inst, xLen)
+          bmh.io.req0.pc := bms_branch
+          bmh.io.req0.modifier := exp_inst(11, 7)
+        //  printf("w: %d\n", w.U)
+        //  printf("Bank Data: %x\n", bank_data)
+        //  printf("F3 Data: %x\n", f3_data)
+        //  printf("inst: %x\n", inst)
+          //printf("BranchMissHistoryRequest: pc: %x, branch %x, modifier %x\n", pc, bms_branch, exp_inst(11, 7))
+        }
       }
 
       f3_is_rvc(i) := isRVC(bank_insts(w))
@@ -729,10 +929,52 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       // Redirect if
       //  1) its a JAL/JALR (unconditional)
       //  2) the BPD believes this is a branch and says we should take it
+      //  3) its a BMS and the BPD believes we should take it
       f3_redirects(i)    := f3_mask(i) && (
         brsigs.cfi_type === CFI_JAL || brsigs.cfi_type === CFI_JALR ||
         (brsigs.cfi_type === CFI_BR && f3_bpd_resp.io.deq.bits.preds(i).taken && useBPD.B)
       )
+
+      //when(RegNext(f3_mask(i)) && RegNext(brsigs.cfi_type === CFI_BMS) && useBPD.B) {
+      //  printf("Before valid: %d take: %d\n", bmh.io.resp0.valid, bmh.io.resp0.bits)
+      //}
+      //
+      //when(f3_mask(i) && brsigs.cfi_type === CFI_BMS && useBPD.B) {
+      //  printf("Current valid: %d take: %d\n", bmh.io.resp0.valid, bmh.io.resp0.bits)
+      //  printf("Next valid: %d take: %d\n", RegNext(bmh.io.resp0.valid), RegNext(bmh.io.resp0.bits))
+      //  printf("Next next valid: %d take: %d\n", RegNext(RegNext(bmh.io.resp0.valid)), RegNext(RegNext(bmh.io.resp0.bits)))
+      //}
+
+      // Redirect if its a BMS and the BMH believes we should take it
+      when(f3_mask(i) && brsigs.cfi_type === CFI_BMS && useBPD.B) {
+        if (w == 0) {
+          when (bank_prev_is_half) {
+            when (bmh.io.resp0.valid && bmh.io.resp0.bits) {
+              f3_redirects(i) := true.B
+              printf("The frontend is redirecting to 0x%x because of a BMS in branch 0x%x\n", brsigs.target, brsigs.bms_branch)
+            }.otherwise {
+              f3_redirects(i) := false.B
+              printf("The frontend is not redirecting to 0x%x because of a BMS in branch 0x%x (valid: %d, take: %d)\n", brsigs.target, brsigs.bms_branch, bmh.io.resp0.valid, bmh.io.resp0.bits)
+            }
+          } .otherwise {
+            when (bmh.io.resp1.valid && bmh.io.resp1.bits) {
+              f3_redirects(i) := true.B
+              printf("The frontend is redirecting to 0x%x because of a BMS in branch 0x%x\n", brsigs.target, brsigs.bms_branch)
+            }.otherwise {
+              f3_redirects(i) := false.B
+              printf("The frontend is not redirecting to 0x%x because of a BMS in branch 0x%x (valid: %d, take: %d)\n", brsigs.target, brsigs.bms_branch, bmh.io.resp1.valid, bmh.io.resp1.bits)
+            }
+          }
+        } else {
+          when (bmh.io.resp0.valid && bmh.io.resp0.bits) {
+            f3_redirects(i) := true.B
+            printf("The frontend is redirecting to 0x%x because of a BMS in branch 0x%x\n", brsigs.target, brsigs.bms_branch)
+          }.otherwise {
+            f3_redirects(i) := false.B
+            printf("The frontend is not redirecting to 0x%x because of a BMS in branch 0x%x (valid: %d, take: %d)\n", brsigs.target, brsigs.bms_branch, bmh.io.resp0.valid, bmh.io.resp0.bits)
+          }
+        }
+      }
 
       f3_br_mask(i)   := f3_mask(i) && brsigs.cfi_type === CFI_BR
       f3_cfi_types(i) := brsigs.cfi_type
@@ -833,6 +1075,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       s0_vpc       := f3_predicted_target
       s0_is_replay := false.B
       s0_ghist     := f3_predicted_ghist
+      //printf("Updating ghist: f3_predicted_ghist\n")
       s0_tsrc      := BSRC_3
 
       f3_fetch_bundle.fsrc := BSRC_3
@@ -923,13 +1166,170 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   ftq.io.enq.valid          := f4.io.deq.valid && fb.io.enq.ready && !f4_delay
   ftq.io.enq.bits           := f4.io.deq.bits
 
-  val bpd_update_arbiter = Module(new Arbiter(new BranchPredictionUpdate, 2))
-  bpd_update_arbiter.io.in(0).valid := ftq.io.bpdupdate.valid
-  bpd_update_arbiter.io.in(0).bits  := ftq.io.bpdupdate.bits
-  assert(bpd_update_arbiter.io.in(0).ready)
-  bpd_update_arbiter.io.in(1) <> f4_btb_corrections.io.deq
-  bpd.io.update := bpd_update_arbiter.io.out
-  bpd_update_arbiter.io.out.ready := true.B
+
+  val bjr_bpd = Module(new BranchPredictor)
+  val bjr_ghist = RegInit(0.U.asTypeOf(new GlobalHistory))
+  bjr_bpd.io := DontCare
+  bjr_bpd.io.f3_fire := false.B
+  bmh.io.updates(coreWidth).valid := false.B
+
+  val bjr_bpd_update = Wire(Valid(new BranchPredictionUpdate))
+  bjr_bpd_update.valid := false.B
+  bjr_bpd_update.bits  := DontCare
+
+  for (i <- 0 until coreWidth) {
+    val f0_bjrinfo = io.cpu.bjrinfos(i)
+    when (f0_bjrinfo.valid) {
+      bjr_bpd.io.f0_req.valid := true.B
+      bjr_bpd.io.f0_req.bits.pc := f0_bjrinfo.branch_block_pc
+      bjr_bpd.io.f0_req.bits.ghist := bjr_ghist
+      //printf("BJR BPD Request: pc: %x, ghist: %b\n", f0_bjrinfo.branch_block_pc, bjr_ghist.old_history)
+    }
+
+    val bjr_bpd_response = bjr_bpd.io.resp.f3
+    val f3_bjrinfo = RegNext(RegNext(RegNext(f0_bjrinfo)))
+    when (bjr_bpd_response.pc === f3_bjrinfo.branch_block_pc && f3_bjrinfo.valid) {
+      bjr_bpd.io.f3_fire := true.B
+      val predicted_taken = bjr_bpd_response.preds(f3_bjrinfo.branch_cfi_idx).taken
+      val predicted_target = bjr_bpd_response.preds(f3_bjrinfo.branch_cfi_idx).predicted_pc.bits
+      val correct_target = f3_bjrinfo.target_pc
+      val correct_taken = f3_bjrinfo.taken
+
+      //printf("Comparison between prediction and BJR:\n\tTaken:\t%d\t<->\t%d\n\tTarget:\t%x\t<->\t%x\n",
+      //  predicted_taken, correct_taken, predicted_target, correct_target)
+
+      val was_mispredicted = predicted_taken =/= correct_taken
+
+      bmh.io.updates(i + coreWidth).valid := true.B
+      bmh.io.updates(i + coreWidth).bits.mispredict := was_mispredicted
+      bmh.io.updates(i + coreWidth).bits.pc := f3_bjrinfo.branch_pc
+
+      val br_mask = 1.U << f3_bjrinfo.branch_cfi_idx
+
+      bjr_bpd_update.valid := true.B
+      bjr_bpd_update.bits.is_mispredict_update := false.B
+      bjr_bpd_update.bits.is_repair_update := false.B
+      bjr_bpd_update.bits.pc := f3_bjrinfo.branch_block_pc
+      bjr_bpd_update.bits.btb_mispredicts := 0.U
+      bjr_bpd_update.bits.br_mask := br_mask
+      bjr_bpd_update.bits.cfi_idx.valid := true.B
+      bjr_bpd_update.bits.cfi_idx.bits := f3_bjrinfo.branch_cfi_idx
+      bjr_bpd_update.bits.cfi_mispredicted := was_mispredicted
+      bjr_bpd_update.bits.cfi_taken := correct_taken
+      bjr_bpd_update.bits.target := f3_bjrinfo.target_pc
+      bjr_bpd_update.bits.cfi_is_br := true.B
+      bjr_bpd_update.bits.cfi_is_jal := false.B
+      bjr_bpd_update.bits.ghist := bjr_ghist
+      bjr_bpd_update.bits.lhist := bjr_bpd_response.lhist
+      bjr_bpd_update.bits.meta := bjr_bpd_response.meta
+
+      /*val redirects = (0 until fetchWidth) map { i =>
+        Mux(i.U === f3_bjrinfo.branch_cfi_idx, correct_taken, bjr_bpd_response.preds(i).taken)
+      }
+      val redirect_idx = PriorityEncoder(redirects)
+      */
+
+      bjr_ghist := RegNext(bjr_ghist).update(
+        br_mask,  // branches
+        correct_taken, // cfi_taken
+        true.B, // cfi_is_br
+        Mux(correct_taken, f3_bjrinfo.branch_cfi_idx, 0.U), // cfi_idx
+        correct_taken && useBPD.B, // cfi_valid
+        f3_bjrinfo.branch_block_pc, // addr
+        false.B, // cfi_is_call
+        false.B // cfi_is_ret
+      )
+
+      printf("BJR GHIST:  %b %b %b %b\n", bjr_ghist.old_history, bjr_ghist.current_saw_branch_not_taken, bjr_ghist.new_saw_branch_not_taken, bjr_ghist.new_saw_branch_taken)
+
+      /*s1_ghist := s0_ghist.update(
+        br_mask,  // branches
+        correct_taken, // cfi_taken
+        true.B, // cfi_is_br
+        Mux(correct_taken, f3_bjrinfo.branch_cfi_idx, 0.U), // cfi_idx
+        correct_taken && useBPD.B, // cfi_valid
+        f3_bjrinfo.branch_block_pc, // addr
+        false.B, // cfi_is_call
+        false.B // cfi_is_ret
+      )
+
+      s2_ghist := s1_ghist.update(
+        br_mask,  // branches
+        correct_taken, // cfi_taken
+        true.B, // cfi_is_br
+        Mux(correct_taken, f3_bjrinfo.branch_cfi_idx, 0.U), // cfi_idx
+        correct_taken && useBPD.B, // cfi_valid
+        f3_bjrinfo.branch_block_pc, // addr
+        false.B, // cfi_is_call
+        false.B // cfi_is_ret
+      )
+
+      f3_fetch_bundle.ghist := f3.io.deq.bits.ghist.update(
+        br_mask,  // branches
+        correct_taken, // cfi_taken
+        true.B, // cfi_is_br
+        Mux(correct_taken, f3_bjrinfo.branch_cfi_idx, 0.U), // cfi_idx
+        correct_taken && useBPD.B, // cfi_valid
+        f3_bjrinfo.branch_block_pc, // addr
+        false.B, // cfi_is_call
+        false.B // cfi_is_ret
+      )*/
+
+      printf("Updating ghist: BJR\n")
+    }
+  }
+
+  val bpd_update_queue = Module(new MultiSourceQueue(new BranchPredictionUpdate, 3, 3))
+  //when (bjr_bpd_update.valid) {
+  //  printf("Queueing BJR update\n")
+  //}
+  //bpd_update_queue.io.enq(0).valid := bjr_bpd_update.valid
+  //bpd_update_queue.io.enq(0).bits  := bjr_bpd_update.bits
+  bpd_update_queue.io.enq(0).valid := false.B
+  bpd_update_queue.io.enq(0).bits  := DontCare
+  bpd_update_queue.io.enq(1).valid := ftq.io.bpdupdate.valid
+  bpd_update_queue.io.enq(1).bits  := ftq.io.bpdupdate.bits
+  bpd_update_queue.io.enq(2).valid := f4_btb_corrections.io.deq.valid
+  bpd_update_queue.io.enq(2).bits  := f4_btb_corrections.io.deq.bits
+  f4_btb_corrections.io.deq.ready := true.B
+  when (bpd_update_queue.io.deq.valid) {
+    bpd.io.update := bpd_update_queue.io.deq
+    //bjr_bpd.io.update := bpd_update_queue.io.deq
+  }.otherwise {
+    bpd.io.update.valid := false.B
+    bpd.io.update.bits  := DontCare
+    //bjr_bpd.io.update.valid := false.B
+    //bjr_bpd.io.update.bits  := DontCare
+  }
+  bjr_bpd.io.update.valid := bjr_bpd_update.valid
+  bjr_bpd.io.update.bits  := bjr_bpd_update.bits
+
+  //val bpd_update_arbiter = Module(new Arbiter(new BranchPredictionUpdate, 3))
+  //bpd_update_arbiter.io.in(1).valid := ftq.io.bpdupdate.valid
+  //bpd_update_arbiter.io.in(1).bits  := ftq.io.bpdupdate.bits
+  //bpd_update_arbiter.io.in(0).valid := bjr_bpd_update.valid
+  //bpd_update_arbiter.io.in(0).bits  := bjr_bpd_update.bits
+  //assert(bpd_update_arbiter.io.in(0).ready)
+  //bpd_update_arbiter.io.in(2) <> f4_btb_corrections.io.deq
+  //bpd.io.update := bpd_update_arbiter.io.out
+  //bpd_update_arbiter.io.out.ready := true.B
+  //val bjr_bpd_update_arbiter = Module(new Arbiter(new BranchPredictionUpdate, 3))
+  //bjr_bpd_update_arbiter.io.in(1).valid := ftq.io.bpdupdate.valid
+  //bjr_bpd_update_arbiter.io.in(1).bits  := ftq.io.bpdupdate.bits
+  //bjr_bpd_update_arbiter.io.in(0).valid := bjr_bpd_update.valid
+  //bjr_bpd_update_arbiter.io.in(0).bits  := bjr_bpd_update.bits
+  //assert(bjr_bpd_update_arbiter.io.in(0).ready)
+  //bjr_bpd_update_arbiter.io.in(2) <> f4_btb_corrections.io.deq
+  //bjr_bpd.io.update := bjr_bpd_update_arbiter.io.out
+  //bjr_bpd_update_arbiter.io.out.ready := true.B
+  // val initial_bpd_update_arbiter_output = Reg(Valid(new BranchPredictionUpdate))
+  // initial_bpd_update_arbiter_output.valid := bpd_update_arbiter.io.out.valid
+  // initial_bpd_update_arbiter_output.bits := bpd_update_arbiter.io.out.bits
+  // when (initial_bpd_update_arbiter_output.valid) {
+  //   printf("BPD Update for %x (%d)\n", initial_bpd_update_arbiter_output.bits.pc, initial_bpd_update_arbiter_output.bits.cfi_taken)
+  // }
+  // val delayed_bpd_update_arbiter_output = RegNext(RegNext(RegNext(initial_bpd_update_arbiter_output)))
+  // bjr_bpd.io.update := delayed_bpd_update_arbiter_output
 
   when (ftq.io.ras_update && enableRasTopRepair.B) {
     ras.io.write_valid := true.B
@@ -975,6 +1375,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_valid     := io.cpu.redirect_val
     s0_vpc       := io.cpu.redirect_pc
     s0_ghist     := io.cpu.redirect_ghist
+    //printf("Updating ghist: io.cpu.redirect_ghist\n")
     s0_tsrc      := BSRC_C
     s0_is_replay := false.B
 

@@ -118,8 +118,8 @@ case class BoomCoreParams(
   val useCryptoNIST = false
   val useCryptoSM = false
   val traceHasWdata = trace
-  val useConditionalZero = false
-
+  val useConditionalZero = true
+  override def hasBMP: Boolean = true
   override def customCSRs(implicit p: Parameters) = new BoomCustomCSRs
 }
 
@@ -186,6 +186,8 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
 
   val numIntPhysRegs= boomParams.numIntPhysRegisters // size of the integer physical register file
   val numFpPhysRegs = boomParams.numFpPhysRegisters  // size of the floating point physical register file
+
+  val branchMissHistoryLength = 50.W
 
   //************************************
   // Functional Units
@@ -254,6 +256,7 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val enableRasTopRepair = boomParams.enableRasTopRepair
 
   val useBPD = boomParams.enableBranchPrediction
+  val useMetaBPD = boomParams.hasBMP
 
   val useLHist = localHistoryNSets > 1 && localHistoryLength > 1
 

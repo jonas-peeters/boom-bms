@@ -44,6 +44,8 @@ import boom.common._
 import boom.ifu.{GlobalHistory, HasBoomFrontendParameters}
 import boom.exu.FUConstants._
 import boom.util._
+import boom.ifu.BranchMissHistoryUpdate
+import boom.ifu.BJRInfo
 
 /**
  * Top level core object that connects the Frontend to the rest of the pipeline.
@@ -196,6 +198,20 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     b := a.io.brinfo
     b.valid := a.io.brinfo.valid && !rob.io.flush.valid
   }
+
+  val bmhus = RegInit(VecInit(Seq.fill(coreWidth)(0.U.asTypeOf(Valid(new BranchMissHistoryUpdate())))))
+  for ((b, a) <- bmhus zip exe_units.alu_units) {
+    b := a.io.bmhu
+  }
+  io.ifu.bmhu := bmhus
+
+  val bjrinfos = Reg(Vec(coreWidth, new BjrInfo()))
+  for ((b, a) <- bjrinfos zip exe_units.alu_units) {
+    b := a.io.bjrinfo
+    b.valid := a.io.bjrinfo.valid && !rob.io.flush.valid
+  }
+  io.ifu.bjrinfos := bjrinfos
+
   b1.resolve_mask := brinfos.map(x => x.valid << x.uop.br_tag).reduce(_|_)
   b1.mispredict_mask := brinfos.map(x => (x.valid && x.mispredict) << x.uop.br_tag).reduce(_|_)
 
@@ -1348,9 +1364,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       // To allow for diffs against spike :/
       def printf_inst(uop: MicroOp) = {
         when (uop.is_rvc) {
-          printf("(0x%x)", uop.debug_inst(15,0))
+          printf("(0x%x) ftq_idx: %d", uop.debug_inst(15,0), uop.ftq_idx)
         } .otherwise {
-          printf("(0x%x)", uop.debug_inst)
+          printf("(0x%x) ftq_idx: %d", uop.debug_inst, uop.ftq_idx)
         }
       }
 
@@ -1372,7 +1388,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         }
       }
     }
-  } else if (BRANCH_PRINTF) {
+  }
+  if (BRANCH_PRINTF) {
     val debug_ghist = RegInit(0.U(globalHistoryLength.W))
     when (rob.io.flush.valid && FlushTypes.useCsrEvec(rob.io.flush.bits.flush_typ)) {
       debug_ghist := 0.U

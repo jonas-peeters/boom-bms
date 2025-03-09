@@ -29,6 +29,7 @@ import FUConstants._
 import boom.common._
 import boom.ifu.{GetPCFromFtqIO}
 import boom.util.{ImmGen, IsKilledByBranch, BranchKillableQueue, BoomCoreStringPrefix}
+import boom.ifu.BranchMissHistoryUpdate
 
 /**
  * Response from Execution Unit. Bundles a MicroOp with data
@@ -136,6 +137,9 @@ abstract class ExecutionUnit(
 
     // TODO move this out of ExecutionUnit
     val com_exception = if (hasMem || hasRocc) Input(Bool()) else null
+
+    val bmhu = if (hasAlu) Output(Valid(new BranchMissHistoryUpdate)) else null
+    val bjrinfo = if (hasAlu) Output(new BjrInfo) else null
   })
 
   io.req.ready := false.B
@@ -295,6 +299,8 @@ class ALUExeUnit(
 
     // branch unit is embedded inside the ALU
     io.brinfo := alu.io.brinfo
+    io.bmhu := alu.io.bmhu
+    io.bjrinfo := alu.io.bjrinfo
     if (hasJmpUnit) {
       alu.io.get_ftq_pc <> io.get_ftq_pc
     }

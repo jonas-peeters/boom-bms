@@ -111,7 +111,14 @@ object AluRRdDecode extends RRdDecodeConstants
          BitPat(uopBGE)   -> List(BR_GE ,Y, N, N, aluFn.FN_SLT , DW_XPR, OP1_X   , OP2_X   , IS_B, REN_0, CSR.N),
          BitPat(uopBGEU)  -> List(BR_GEU,Y, N, N, aluFn.FN_SLTU, DW_XPR, OP1_X   , OP2_X   , IS_B, REN_0, CSR.N),
          BitPat(uopBLT)   -> List(BR_LT ,Y, N, N, aluFn.FN_SLT , DW_XPR, OP1_X   , OP2_X   , IS_B, REN_0, CSR.N),
-         BitPat(uopBLTU)  -> List(BR_LTU,Y, N, N, aluFn.FN_SLTU, DW_XPR, OP1_X   , OP2_X   , IS_B, REN_0, CSR.N))
+         BitPat(uopBLTU)  -> List(BR_LTU,Y, N, N, aluFn.FN_SLTU, DW_XPR, OP1_X   , OP2_X   , IS_B, REN_0, CSR.N),
+
+         BitPat(uopBMS)   -> List(BR_BMS,Y, N, N, aluFn.FN_ADD , DW_XPR, OP1_X   , OP2_X   , IS_B, REN_0, CSR.N),
+         BitPat(uopBJR)   -> List(BR_N  ,Y, N, N, aluFn.FN_ADD , DW_XPR, OP1_PC  , OP2_X   , IS_I, REN_1, CSR.N),
+
+        BitPat(uopCZEROEQZ)->List(BR_N , Y, N, N,aluFn.FN_CZEQZ, DW_XPR, OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N),
+        BitPat(uopCZERONEZ)->List(BR_N , Y, N, N,aluFn.FN_CZNEZ, DW_XPR, OP1_RS1 , OP2_RS2 , IS_X, REN_1, CSR.N)
+  )
 }
 
 object JmpRRdDecode extends RRdDecodeConstants
