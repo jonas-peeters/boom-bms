@@ -1377,49 +1377,11 @@ class BoomFrontendModule(outer: BoomFrontend)
       //  bjr_ghist.new_saw_branch_taken
       //)
 
-      s0_ghist := RegNext(s0_ghist).update(
-        br_mask, // branches
-        correct_taken, // cfi_taken
-        true.B, // cfi_is_br
-        Mux(correct_taken, f3_bjrinfo.branch_cfi_idx, 0.U), // cfi_idx
-        correct_taken && useBPD.B, // cfi_valid
-        f3_bjrinfo.branch_block_pc, // addr
-        false.B, // cfi_is_call
-        false.B // cfi_is_ret
-      )
-
-      /*s1_ghist := s0_ghist.update(
-        br_mask,  // branches
-        correct_taken, // cfi_taken
-        true.B, // cfi_is_br
-        Mux(correct_taken, f3_bjrinfo.branch_cfi_idx, 0.U), // cfi_idx
-        correct_taken && useBPD.B, // cfi_valid
-        f3_bjrinfo.branch_block_pc, // addr
-        false.B, // cfi_is_call
-        false.B // cfi_is_ret
-      )
-
-      s2_ghist := s1_ghist.update(
-        br_mask,  // branches
-        correct_taken, // cfi_taken
-        true.B, // cfi_is_br
-        Mux(correct_taken, f3_bjrinfo.branch_cfi_idx, 0.U), // cfi_idx
-        correct_taken && useBPD.B, // cfi_valid
-        f3_bjrinfo.branch_block_pc, // addr
-        false.B, // cfi_is_call
-        false.B // cfi_is_ret
-      )
-
-      f3_fetch_bundle.ghist := f3.io.deq.bits.ghist.update(
-        br_mask,  // branches
-        correct_taken, // cfi_taken
-        true.B, // cfi_is_br
-        Mux(correct_taken, f3_bjrinfo.branch_cfi_idx, 0.U), // cfi_idx
-        correct_taken && useBPD.B, // cfi_valid
-        f3_bjrinfo.branch_block_pc, // addr
-        false.B, // cfi_is_call
-        false.B // cfi_is_ret
-      )*/
+      // NOTE: deliberately NOT splicing the virtual (BJR) outcome into the
+      // main pipeline's s0_ghist. A mid-flight splice races with the
+      // f1/f2/f3 ghist drivers, uses a stale (RegNext) basis, and is undone
+      // by any FTQ ghist restore on a later mispredict — corrupting the
+      // main predictor's history. Virtual outcomes live only in bjr_ghist.
 
       //printf("Updating ghist: BJR\n")
     }
