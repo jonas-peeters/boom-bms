@@ -1310,6 +1310,10 @@ class BoomFrontendModule(outer: BoomFrontend)
       bjr_bpd.io.f0_req.bits.ghist := bjr_ghist
       // printf("BJR BPD Request: pc: %x, ghist: %b\n", f0_bjrinfo.branch_block_pc, bjr_ghist.old_history)
     }
+    // Snapshot the history the prediction was made with, so the update
+    // three cycles later trains under the SAME history (not whatever
+    // bjr_ghist has become in the meantime).
+    val f3_bjr_req_ghist = RegNext(RegNext(RegNext(bjr_ghist)))
 
     val bjr_bpd_response = bjr_bpd.io.resp.f3
     val f3_bjrinfo = RegNext(RegNext(RegNext(f0_bjrinfo)))
@@ -1348,7 +1352,7 @@ class BoomFrontendModule(outer: BoomFrontend)
       bjr_bpd_update.bits.target := f3_bjrinfo.target_pc
       bjr_bpd_update.bits.cfi_is_br := true.B
       bjr_bpd_update.bits.cfi_is_jal := false.B
-      bjr_bpd_update.bits.ghist := bjr_ghist
+      bjr_bpd_update.bits.ghist := f3_bjr_req_ghist
       bjr_bpd_update.bits.lhist := bjr_bpd_response.lhist
       bjr_bpd_update.bits.meta := bjr_bpd_response.meta
 
@@ -1358,7 +1362,7 @@ class BoomFrontendModule(outer: BoomFrontend)
       val redirect_idx = PriorityEncoder(redirects)
        */
 
-      bjr_ghist := RegNext(bjr_ghist).update(
+      bjr_ghist := bjr_ghist.update(
         br_mask, // branches
         correct_taken, // cfi_taken
         true.B, // cfi_is_br
