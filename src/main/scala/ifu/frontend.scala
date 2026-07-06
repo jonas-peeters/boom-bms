@@ -341,7 +341,9 @@ class BranchMissHistory(implicit p: Parameters)
     (pc >> 1.U) & (tableSize - 1).U
   }
 
-  val history = Reg(Vec(tableSize, new BranchMissHistoryEntry))
+  val history = RegInit(
+    VecInit(Seq.fill(tableSize)(0.U.asTypeOf(new BranchMissHistoryEntry)))
+  )
 
   for (update <- io.updates) {
     when(update.valid) {
@@ -381,15 +383,20 @@ class BranchMissHistory(implicit p: Parameters)
 
     val threshold = 36.U + req.modifier * 2.U
 
-    when(req.valid && entry.pc === req.pc && PopCount(entry.valid) > 0.U) {
-        printf("Check BMS @ %x: percentage: %d, threshold: %d\n",
-          entry.pc,
-          (successfulPredictions * 100.U) / totalPredictions,
-          threshold
-        )
+    // Don't decide from noise: below MIN_SAMPLES observations the entry
+    // stays on the branchy path (equivalent to a cold predictor).
+    val MIN_SAMPLES = 8
+    val enoughSamples = totalPredictions >= MIN_SAMPLES.U
+
+    when(req.valid && entry.pc === req.pc) {
+        // raw counts: no divider in the printf, no x/0 when valid==0
+        printf("Check BMS @ %x: correct %d / total %d, threshold: %d\n",
+          entry.pc, successfulPredictions, totalPredictions, threshold)
     }
 
-    (successfulPredictions * 100.U) / totalPredictions <= threshold
+    // s/t <= th/100  <=>  s*100 <= th*t   (no divider on the F3 path)
+    enoughSamples &&
+      (successfulPredictions * 100.U <= threshold * totalPredictions)
   }
 
   val index0 = calcIndex(io.req0.pc)
