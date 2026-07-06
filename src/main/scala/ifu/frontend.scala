@@ -1297,6 +1297,7 @@ class BoomFrontendModule(outer: BoomFrontend)
   val bjr_ghist = RegInit(0.U.asTypeOf(new GlobalHistory))
   bjr_bpd.io := DontCare
   bjr_bpd.io.f3_fire := false.B
+  bjr_bpd.io.f0_req.valid := false.B
   
   val bjr_bpd_update = Wire(Valid(new BranchPredictionUpdate))
   bjr_bpd_update.valid := false.B
@@ -1305,93 +1306,90 @@ class BoomFrontendModule(outer: BoomFrontend)
   for (i <- 0 until coreWidth) {
     bmh.io.updates(i + coreWidth) := DontCare
     bmh.io.updates(i + coreWidth).valid := false.B
-    
-    val f0_bjrinfo = io.cpu.bjrinfos(i)
-    when(f0_bjrinfo.valid) {
-      bjr_bpd.io.f0_req.valid := true.B
-      bjr_bpd.io.f0_req.bits.pc := f0_bjrinfo.branch_block_pc
-      bjr_bpd.io.f0_req.bits.ghist := bjr_ghist
-      // printf("BJR BPD Request: pc: %x, ghist: %b\n", f0_bjrinfo.branch_block_pc, bjr_ghist.old_history)
-    }
-    // Snapshot the history the prediction was made with, so the update
-    // three cycles later trains under the SAME history (not whatever
-    // bjr_ghist has become in the meantime).
-    val f3_bjr_req_ghist = RegNext(RegNext(RegNext(bjr_ghist)))
+  }
 
-    val bjr_bpd_response = bjr_bpd.io.resp.f3
-    val f3_bjrinfo = RegNext(RegNext(RegNext(f0_bjrinfo)))
-    when(
-      bjr_bpd_response.pc === f3_bjrinfo.branch_block_pc && f3_bjrinfo.valid
-    ) {
-      bjr_bpd.io.f3_fire := true.B
-      val predicted_taken =
-        bjr_bpd_response.preds(f3_bjrinfo.branch_cfi_idx).taken
-      val predicted_target =
-        bjr_bpd_response.preds(f3_bjrinfo.branch_cfi_idx).predicted_pc.bits
-      val correct_target = f3_bjrinfo.target_pc
-      val correct_taken = f3_bjrinfo.taken
+  // ------------------------------------------------------------------
+  // Arbitrate: at most one BJR retro-prediction enters the 3-cycle
+  // pipeline per cycle. Additional same-cycle BJRs are dropped LOUDLY
+  // (perf counter + assert in sim) instead of racing on the shared
+  // f0_req / bjr_bpd_update / bjr_ghist resources via last-connect.
+  // ------------------------------------------------------------------
+  val bjr_valids = VecInit(io.cpu.bjrinfos.map(_.valid))
+  val bjr_sel    = PriorityEncoder(bjr_valids)
+  val bjr_any    = bjr_valids.asUInt.orR
+  val f0_bjr     = io.cpu.bjrinfos(bjr_sel)
+  val bjr_dropped = RegInit(0.U(32.W))
+  when(PopCount(bjr_valids) > 1.U) {
+    bjr_dropped := bjr_dropped + (PopCount(bjr_valids) - 1.U)
+  }
+  assert(PopCount(bjr_valids) <= 1.U,
+    "Multiple BJRs resolved in one cycle; one retro-update was dropped")
 
-      // printf("Comparison between prediction and BJR:\n\tTaken:\t%d\t<->\t%d\n\tTarget:\t%x\t<->\t%x\n",
-      //  predicted_taken, correct_taken, predicted_target, correct_target)
+  when(bjr_any) {
+    bjr_bpd.io.f0_req.valid := true.B
+    bjr_bpd.io.f0_req.bits.pc := f0_bjr.branch_block_pc
+    bjr_bpd.io.f0_req.bits.ghist := bjr_ghist
+  }
 
-      val was_mispredicted = predicted_taken =/= correct_taken
+  // Pipeline the WINNER (not the raw per-ALU inputs) and the ghist
+  // snapshot the prediction was made with (see the bjr_ghist fix).
+  val f3_bjr_valid     = RegNext(RegNext(RegNext(bjr_any, false.B), false.B), false.B)
+  val f3_bjrinfo       = RegNext(RegNext(RegNext(f0_bjr)))
+  val f3_bjr_req_ghist = RegNext(RegNext(RegNext(bjr_ghist)))
 
-      bmh.io.updates(i + coreWidth).valid := true.B
-      bmh.io.updates(i + coreWidth).bits.mispredict := was_mispredicted
-      bmh.io.updates(i + coreWidth).bits.pc := f3_bjrinfo.branch_pc
+  val bjr_bpd_response = bjr_bpd.io.resp.f3
+  when(
+    f3_bjr_valid && bjr_bpd_response.pc === f3_bjrinfo.branch_block_pc
+  ) {
+    bjr_bpd.io.f3_fire := true.B
+    val predicted_taken =
+      bjr_bpd_response.preds(f3_bjrinfo.branch_cfi_idx).taken
+    val predicted_target =
+      bjr_bpd_response.preds(f3_bjrinfo.branch_cfi_idx).predicted_pc.bits
+    val correct_target = f3_bjrinfo.target_pc
+    val correct_taken = f3_bjrinfo.taken
 
-      val br_mask = 1.U << f3_bjrinfo.branch_cfi_idx
+    val was_mispredicted = predicted_taken =/= correct_taken
 
-      bjr_bpd_update.valid := true.B
-      bjr_bpd_update.bits.is_mispredict_update := false.B
-      bjr_bpd_update.bits.is_repair_update := false.B
-      bjr_bpd_update.bits.pc := f3_bjrinfo.branch_block_pc
-      bjr_bpd_update.bits.btb_mispredicts := 0.U
-      bjr_bpd_update.bits.br_mask := br_mask
-      bjr_bpd_update.bits.cfi_idx.valid := true.B
-      bjr_bpd_update.bits.cfi_idx.bits := f3_bjrinfo.branch_cfi_idx
-      bjr_bpd_update.bits.cfi_mispredicted := was_mispredicted
-      bjr_bpd_update.bits.cfi_taken := correct_taken
-      bjr_bpd_update.bits.target := f3_bjrinfo.target_pc
-      bjr_bpd_update.bits.cfi_is_br := true.B
-      bjr_bpd_update.bits.cfi_is_jal := false.B
-      bjr_bpd_update.bits.ghist := f3_bjr_req_ghist
-      bjr_bpd_update.bits.lhist := bjr_bpd_response.lhist
-      bjr_bpd_update.bits.meta := bjr_bpd_response.meta
+    bmh.io.updates(coreWidth).valid := true.B
+    bmh.io.updates(coreWidth).bits.mispredict := was_mispredicted
+    bmh.io.updates(coreWidth).bits.pc := f3_bjrinfo.branch_pc
 
-      /*val redirects = (0 until fetchWidth) map { i =>
-        Mux(i.U === f3_bjrinfo.branch_cfi_idx, correct_taken, bjr_bpd_response.preds(i).taken)
-      }
-      val redirect_idx = PriorityEncoder(redirects)
-       */
+    val br_mask = 1.U << f3_bjrinfo.branch_cfi_idx
 
-      bjr_ghist := bjr_ghist.update(
-        br_mask, // branches
-        correct_taken, // cfi_taken
-        true.B, // cfi_is_br
-        Mux(correct_taken, f3_bjrinfo.branch_cfi_idx, 0.U), // cfi_idx
-        correct_taken && useBPD.B, // cfi_valid
-        f3_bjrinfo.branch_block_pc, // addr
-        false.B, // cfi_is_call
-        false.B // cfi_is_ret
-      )
+    bjr_bpd_update.valid := true.B
+    bjr_bpd_update.bits.is_mispredict_update := false.B
+    bjr_bpd_update.bits.is_repair_update := false.B
+    bjr_bpd_update.bits.pc := f3_bjrinfo.branch_block_pc
+    bjr_bpd_update.bits.btb_mispredicts := 0.U
+    bjr_bpd_update.bits.br_mask := br_mask
+    bjr_bpd_update.bits.cfi_idx.valid := true.B
+    bjr_bpd_update.bits.cfi_idx.bits := f3_bjrinfo.branch_cfi_idx
+    bjr_bpd_update.bits.cfi_mispredicted := was_mispredicted
+    bjr_bpd_update.bits.cfi_taken := correct_taken
+    bjr_bpd_update.bits.target := f3_bjrinfo.target_pc
+    bjr_bpd_update.bits.cfi_is_br := true.B
+    bjr_bpd_update.bits.cfi_is_jal := false.B
+    bjr_bpd_update.bits.ghist := f3_bjr_req_ghist
+    bjr_bpd_update.bits.lhist := bjr_bpd_response.lhist
+    bjr_bpd_update.bits.meta := bjr_bpd_response.meta
 
-      //printf(
-      //  "BJR GHIST:  %b %b %b %b\n",
-      //  bjr_ghist.old_history,
-      //  bjr_ghist.current_saw_branch_not_taken,
-      //  bjr_ghist.new_saw_branch_not_taken,
-      //  bjr_ghist.new_saw_branch_taken
-      //)
+    bjr_ghist := bjr_ghist.update(
+      br_mask, // branches
+      correct_taken, // cfi_taken
+      true.B, // cfi_is_br
+      Mux(correct_taken, f3_bjrinfo.branch_cfi_idx, 0.U), // cfi_idx
+      correct_taken && useBPD.B, // cfi_valid
+      f3_bjrinfo.branch_block_pc, // addr
+      false.B, // cfi_is_call
+      false.B // cfi_is_ret
+    )
 
-      // NOTE: deliberately NOT splicing the virtual (BJR) outcome into the
-      // main pipeline's s0_ghist. A mid-flight splice races with the
-      // f1/f2/f3 ghist drivers, uses a stale (RegNext) basis, and is undone
-      // by any FTQ ghist restore on a later mispredict — corrupting the
-      // main predictor's history. Virtual outcomes live only in bjr_ghist.
-
-      //printf("Updating ghist: BJR\n")
-    }
+    // NOTE: deliberately NOT splicing the virtual (BJR) outcome into the
+    // main pipeline's s0_ghist. A mid-flight splice races with the
+    // f1/f2/f3 ghist drivers, uses a stale (RegNext) basis, and is undone
+    // by any FTQ ghist restore on a later mispredict — corrupting the
+    // main predictor's history. Virtual outcomes live only in bjr_ghist.
   }
 
   val bpd_update_queue = Module(
