@@ -489,7 +489,11 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     val block_pc = AlignPCToBoundary(io.get_ftq_pc.pc, icBlockBytes)
     val uop_pc = (block_pc | uop.pc_lob) - Mux(uop.edge_inst, 2.U, 0.U)
     
-    io.bmhu.valid := brinfo.valid
+    // Train the miss history only on real conditional branches:
+    //  - not JALR (target mispredicts are a different phenomenon),
+    //  - not BMS itself (never mispredicts by construction; would only
+    //    burn a table slot next to the branch it guards).
+    io.bmhu.valid := is_br && uop.inst =/= BMS
     io.bmhu.bits.mispredict := brinfo.mispredict
     io.bmhu.bits.pc := uop_pc
     io.bmhu.bits.br_mask := GetNewBrMask(io.brupdate, uop)
