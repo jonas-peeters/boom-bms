@@ -345,31 +345,27 @@ class BranchMissHistory(implicit p: Parameters)
     VecInit(Seq.fill(tableSize)(0.U.asTypeOf(new BranchMissHistoryEntry)))
   )
 
-  for (update <- io.updates) {
-    when(update.valid) {
-      val index = calcIndex(update.bits.pc)
-      when(history(index).pc === update.bits.pc) {
-        // If the entry is for the same PC, update the taken history, and mark the history as valid
-        history(index).mispredictionHistory := history(
-          index
-        ).mispredictionHistory * 2.U + update.bits.mispredict
-        history(index).valid := history(index).valid * 2.U + 1.U
-        // printf("Updating BranchMissHistory Taken: %x %b %b\n",
-        //  update.bits.pc,
-        //  history(index).mispredictionHistory * 2.U + update.bits.mispredict,
-        //  history(index).valid * 2.U + 1.U)
-      }.otherwise {
-        history(index).pc := update.bits.pc
-        history(index).mispredictionHistory := 0.U(
-          branchMissHistoryLength
-        ) + update.bits.mispredict
-        history(index).valid := 1.U(branchMissHistoryLength)
-        // printf("Initializing BranchMissHistory Taken: %x %b %b\n",
-        //  update.bits.pc,
-        //  0.U(branchMissHistoryLength) + update.bits.mispredict,
-        //  1.U(branchMissHistoryLength))
-      }
+  // Fold all same-cycle updates into each entry in port order, so that
+  // multiple updates hitting the same index in one cycle are ALL applied
+  // (read-modify-write chained combinationally) instead of last-connect
+  // silently dropping all but one.
+  for (idx <- 0 until tableSize) {
+    var pc   = history(idx).pc
+    var hist = history(idx).mispredictionHistory
+    var vld  = history(idx).valid
+    for (update <- io.updates) {
+      val hit    = update.valid && (calcIndex(update.bits.pc) === idx.U)
+      val samePc = update.bits.pc === pc
+      val nhist  = Mux(samePc, hist * 2.U + update.bits.mispredict,
+                               0.U(branchMissHistoryLength) + update.bits.mispredict)
+      val nvld   = Mux(samePc, vld * 2.U + 1.U, 1.U(branchMissHistoryLength))
+      pc   = Mux(hit, update.bits.pc, pc)
+      hist = Mux(hit, nhist, hist)
+      vld  = Mux(hit, nvld,  vld)
     }
+    history(idx).pc := pc
+    history(idx).mispredictionHistory := hist
+    history(idx).valid := vld
   }
 
   def checkPrediction(
