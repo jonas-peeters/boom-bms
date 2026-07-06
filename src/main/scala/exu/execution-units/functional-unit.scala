@@ -425,7 +425,10 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   brinfo.uop            := uop
   brinfo.cfi_type       := Mux(is_jalr, CFI_JALR,
                            Mux(is_br  , CFI_BR, CFI_X))
-  brinfo.taken          := Mux(is_bjr, rs1, is_taken)
+  // BJR result register: ISA contract is C-style truthiness (nonzero =
+  // taken), NOT bit 0 and NOT ===1. One definition, used everywhere.
+  val bjr_taken          = rs1 =/= 0.U
+  brinfo.taken          := Mux(is_bjr, bjr_taken, is_taken)
   brinfo.pc_sel         := pc_sel
 
   brinfo.jalr_target    := DontCare
@@ -512,7 +515,7 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
 
     val bjrinfo = Wire(new BjrInfo)
     bjrinfo.valid := is_bjr
-    bjrinfo.taken := rs1
+    bjrinfo.taken := bjr_taken
     bjrinfo.br_mask := GetNewBrMask(io.brupdate, uop)
 
     val bjr_block_pc = AlignPCToBoundary(io.get_ftq_pc.pc, icBlockBytes)
@@ -533,7 +536,10 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     }
 
     val target_pc = ComputeBJRBranchTarget(bjr_pc, uop.inst, xLen)
-    bjrinfo.target_pc := Mux(rs1 === true.B, target_pc, branch_pc + 4.U)
+    // Fall-through assumes the problematic branch is a 32-bit instruction
+    // (documented Xbmis constraint: the guarded branch must not be
+    // compressed; see fixes/fix-10). '+4' is wrong for a 2-byte c.branch.
+    bjrinfo.target_pc := Mux(bjr_taken, target_pc, branch_pc + 4.U)
     io.bjrinfo := bjrinfo
   }
 
