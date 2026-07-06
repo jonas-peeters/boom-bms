@@ -381,7 +381,7 @@ class BranchMissHistory(implicit p: Parameters)
 
     val threshold = 36.U + req.modifier * 2.U
 
-    when(entry.pc === req.pc) {
+    when(req.valid && entry.pc === req.pc && PopCount(entry.valid) > 0.U) {
         printf("Check BMS @ %x: percentage: %d, threshold: %d\n",
           entry.pc,
           (successfulPredictions * 100.U) / totalPredictions,
@@ -396,7 +396,7 @@ class BranchMissHistory(implicit p: Parameters)
   val entry0 = history(index0)
   io.resp0.valid := false.B
   io.resp0.bits := false.B
-  when(entry0.pc === io.req0.pc && PopCount(entry0.valid) > 0.U) {
+  when(io.req0.valid && entry0.pc === io.req0.pc && PopCount(entry0.valid) > 0.U) {
     io.resp0.valid := entry0.pc === io.req0.pc
     io.resp0.bits := checkPrediction(entry0, io.req0)
     //printf(
@@ -412,7 +412,7 @@ class BranchMissHistory(implicit p: Parameters)
   val entry1 = history(index1)
   io.resp1.valid := false.B
   io.resp1.bits := false.B
-  when(entry1.pc === io.req1.pc && PopCount(entry1.valid) > 0.U) {
+  when(io.req1.valid && entry1.pc === io.req1.pc && PopCount(entry1.valid) > 0.U) {
     io.resp1.valid := entry1.pc === io.req1.pc
     io.resp1.bits := checkPrediction(entry1, io.req1)
     //printf(
@@ -568,6 +568,10 @@ class BoomFrontendModule(outer: BoomFrontend)
   }
   bmh.io.req0 := DontCare
   bmh.io.req1 := DontCare
+  // Default: no request. Slots below only ever drive valid to true, so a
+  // BMS in ANY slot survives last-connect (no .otherwise clobber).
+  bmh.io.req0.valid := false.B
+  bmh.io.req1.valid := false.B
 
   val ras = Module(new BoomRAS)
 
@@ -877,27 +881,28 @@ class BoomFrontendModule(outer: BoomFrontend)
         val bpd_decoder0 = Module(new BranchDecode)
         bpd_decoder0.io.inst := exp_inst0
         bpd_decoder0.io.pc := pc0
-        when(exp_inst0 === BMS) {
+        // Only query the BMH when this slot really holds this instruction:
+        // inst0 is the cross-boundary instruction, selected iff
+        // bank_prev_is_half; the slot must also be inside the fetch mask.
+        when(bank_prev_is_half && f3.io.deq.valid &&
+             f3_imemresp.mask(i) && exp_inst0 === BMS) {
           val bms_branch0 = ComputeBMSBranch(pc0, exp_inst0, xLen)
           bmh.io.req0.pc := bms_branch0
           bmh.io.req0.modifier := exp_inst0(11, 7)
           bmh.io.req0.valid := true.B
           printf("BranchMissHistoryRequest0: pc: %x, branch %x, modifier %x\n", pc0, bms_branch0, exp_inst0(11, 7))
-        }.otherwise {
-          bmh.io.req0.valid := false.B
         }
 
         val bpd_decoder1 = Module(new BranchDecode)
         bpd_decoder1.io.inst := exp_inst1
         bpd_decoder1.io.pc := pc1
-        when(exp_inst1 === BMS) {
+        when(!bank_prev_is_half && f3.io.deq.valid &&
+             f3_imemresp.mask(i) && exp_inst1 === BMS) {
           val bms_branch1 = ComputeBMSBranch(pc1, exp_inst1, xLen)
           bmh.io.req1.pc := bms_branch1
           bmh.io.req1.modifier := exp_inst1(11, 7)
           bmh.io.req1.valid := true.B
           printf("BranchMissHistoryRequest1: pc: %x, branch %x, modifier %x\n", pc1, bms_branch1, exp_inst1(11, 7))
-        }.otherwise {
-          bmh.io.req1.valid := false.B
         }
         // when(exp_inst0(6, 0) === 11.U || exp_inst1(6, 0) === 11.U) {
         //  printf("w: %d\n", w.U)
@@ -966,7 +971,10 @@ class BoomFrontendModule(outer: BoomFrontend)
           valid := !(bank_mask(w - 1) && !isRVC(bank_insts(w - 1)))
         }
 
-        when(exp_inst === BMS) {
+        // valid is fully assigned above; gate the request on the slot
+        // being a real instruction inside the fetch mask.
+        when(valid && f3.io.deq.valid && f3_imemresp.mask(i) &&
+             exp_inst === BMS) {
           val bms_branch = ComputeBMSBranch(pc, exp_inst, xLen)
           bmh.io.req0.pc := bms_branch
           bmh.io.req0.modifier := exp_inst(11, 7)
@@ -976,8 +984,6 @@ class BoomFrontendModule(outer: BoomFrontend)
           //  printf("F3 Data: %x\n", f3_data)
           //  printf("inst: %x\n", inst)
           printf("BranchMissHistoryRequest: pc: %x, branch %x, modifier %x\n", pc, bms_branch, exp_inst(11, 7))
-        }.otherwise {
-          bmh.io.req0.valid := false.B
         }
       }
 
@@ -1097,6 +1103,12 @@ class BoomFrontendModule(outer: BoomFrontend)
   f3_fetch_bundle.cfi_npc_plus4 := f3_npc_plus4_mask(
     f3_fetch_bundle.cfi_idx.bits
   )
+
+  // Two decoded BMS in one packet would collide on the shared req0 port.
+  // Make it loud in simulation until per-slot request ports exist.
+  assert(PopCount((0 until fetchWidth).map(i =>
+    f3_mask(i) && f3_cfi_types(i) === CFI_BMS)) <= 1.U,
+    "Multiple BMS instructions in one fetch packet are not supported yet")
 
   f3_fetch_bundle.ghist := f3.io.deq.bits.ghist
   f3_fetch_bundle.lhist := f3_bpd_resp.io.deq.bits.lhist
