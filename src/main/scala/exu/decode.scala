@@ -303,7 +303,7 @@ object BMISSDecode extends DecodeConstants
             //    |  |  |  |           |        unit    regtype |       |       |  |     |  |  |  |  |  cmd    |    |  |  |  |  flush on commit
             //    |  |  |  |           |        |       |       |       |       |  |     |  |  |  |  |  |      |    |  |  |  |  |  csr cmd
   BMS     -> List(Y, N, X, uopBMS   , IQT_INT, FU_JMP , RT_X  , RT_X  , RT_X  , N, IS_X, N, N, N, N, N, M_X  , 0.U, Y, Y, N, N, N, CSR.N),
-  BJR     -> List(Y, N, X, uopBJR   , IQT_INT, FU_ALU , RT_X  , RT_FIX, RT_X  , N, IS_I, N, N, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N)
+  BJR     -> List(Y, N, X, uopBJR   , IQT_INT, FU_JMP , RT_X  , RT_FIX, RT_X  , N, IS_I, N, N, N, N, N, M_X  , 0.U, N, N, N, N, N, CSR.N)
   )
 }
 
@@ -630,7 +630,6 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
   uop.is_br          := cs.is_br
   uop.is_jal         := (uop.uopc === uopJAL)
   uop.is_jalr        := (uop.uopc === uopJALR)
-  uop.is_bms         := (uop.uopc === uopBMS)
   // uop.is_jump        := cs.is_jal || (uop.uopc === uopJALR)
   // uop.is_ret         := (uop.uopc === uopJALR) &&
   //                       (uop.ldst === X0) &&
@@ -654,8 +653,6 @@ class BranchDecodeSignals(implicit p: Parameters) extends BoomBundle
   val is_ret       = Bool()
   val is_call      = Bool()
   val target       = UInt(vaddrBitsExtended.W)
-  val bms_branch   = UInt(vaddrBitsExtended.W)
-  val bms_modifier = UInt(5.W)
   val cfi_type     = UInt(CFI_SZ.W)
 
 
@@ -676,61 +673,60 @@ class BranchDecode(implicit p: Parameters) extends BoomModule
 
   val bpd_csignals =
     freechips.rocketchip.rocket.DecodeLogic(io.inst,
-                  List[BitPat](N, N, N, N, X, N),
+                  List[BitPat](N, N, N, N, X),
 ////                               is br?
 ////                               |  is jal?
 ////                               |  |  is jalr?
 ////                               |  |  |
 ////                               |  |  |  shadowable
 ////                               |  |  |  |  has_rs2
-////                               |  |  |  |  |  is bms?
-////                               |  |  |  |  |  |
+////                               |  |  |  |  |
             Array[(BitPat, List[BitPat])](
-               JAL         -> List(N, Y, N, N, X, N),
-               JALR        -> List(N, N, Y, N, X, N),
-               BEQ         -> List(Y, N, N, N, X, N),
-               BNE         -> List(Y, N, N, N, X, N),
-               BGE         -> List(Y, N, N, N, X, N),
-               BGEU        -> List(Y, N, N, N, X, N),
-               BLT         -> List(Y, N, N, N, X, N),
-               BLTU        -> List(Y, N, N, N, X, N),
+               JAL         -> List(N, Y, N, N, X),
+               JALR        -> List(N, N, Y, N, X),
+               BEQ         -> List(Y, N, N, N, X),
+               BNE         -> List(Y, N, N, N, X),
+               BGE         -> List(Y, N, N, N, X),
+               BGEU        -> List(Y, N, N, N, X),
+               BLT         -> List(Y, N, N, N, X),
+               BLTU        -> List(Y, N, N, N, X),
 
-               SLLI        -> List(N, N, N, Y, N, N),
-               SRLI        -> List(N, N, N, Y, N, N),
-               SRAI        -> List(N, N, N, Y, N, N),
+               SLLI        -> List(N, N, N, Y, N),
+               SRLI        -> List(N, N, N, Y, N),
+               SRAI        -> List(N, N, N, Y, N),
 
-               ADDIW       -> List(N, N, N, Y, N, N),
-               SLLIW       -> List(N, N, N, Y, N, N),
-               SRAIW       -> List(N, N, N, Y, N, N),
-               SRLIW       -> List(N, N, N, Y, N, N),
+               ADDIW       -> List(N, N, N, Y, N),
+               SLLIW       -> List(N, N, N, Y, N),
+               SRAIW       -> List(N, N, N, Y, N),
+               SRLIW       -> List(N, N, N, Y, N),
 
-               ADDW        -> List(N, N, N, Y, Y, N),
-               SUBW        -> List(N, N, N, Y, Y, N),
-               SLLW        -> List(N, N, N, Y, Y, N),
-               SRAW        -> List(N, N, N, Y, Y, N),
-               SRLW        -> List(N, N, N, Y, Y, N),
+               ADDW        -> List(N, N, N, Y, Y),
+               SUBW        -> List(N, N, N, Y, Y),
+               SLLW        -> List(N, N, N, Y, Y),
+               SRAW        -> List(N, N, N, Y, Y),
+               SRLW        -> List(N, N, N, Y, Y),
 
-               LUI         -> List(N, N, N, Y, N, N),
+               LUI         -> List(N, N, N, Y, N),
 
-               ADDI        -> List(N, N, N, Y, N, N),
-               ANDI        -> List(N, N, N, Y, N, N),
-               ORI         -> List(N, N, N, Y, N, N),
-               XORI        -> List(N, N, N, Y, N, N),
-               SLTI        -> List(N, N, N, Y, N, N),
-               SLTIU       -> List(N, N, N, Y, N, N),
+               ADDI        -> List(N, N, N, Y, N),
+               ANDI        -> List(N, N, N, Y, N),
+               ORI         -> List(N, N, N, Y, N),
+               XORI        -> List(N, N, N, Y, N),
+               SLTI        -> List(N, N, N, Y, N),
+               SLTIU       -> List(N, N, N, Y, N),
 
-               SLL         -> List(N, N, N, Y, Y, N),
-               ADD         -> List(N, N, N, Y, Y, N),
-               SUB         -> List(N, N, N, Y, Y, N),
-               SLT         -> List(N, N, N, Y, Y, N),
-               SLTU        -> List(N, N, N, Y, Y, N),
-               AND         -> List(N, N, N, Y, Y, N),
-               OR          -> List(N, N, N, Y, Y, N),
-               XOR         -> List(N, N, N, Y, Y, N),
-               SRA         -> List(N, N, N, Y, Y, N),
-               SRL         -> List(N, N, N, Y, Y, N),
+               SLL         -> List(N, N, N, Y, Y),
+               ADD         -> List(N, N, N, Y, Y),
+               SUB         -> List(N, N, N, Y, Y),
+               SLT         -> List(N, N, N, Y, Y),
+               SLTU        -> List(N, N, N, Y, Y),
+               AND         -> List(N, N, N, Y, Y),
+               OR          -> List(N, N, N, Y, Y),
+               XOR         -> List(N, N, N, Y, Y),
+               SRA         -> List(N, N, N, Y, Y),
+               SRL         -> List(N, N, N, Y, Y),
 
-               BMS         -> List(N, N, N, N, X, Y),
+               BMS         -> List(N, N, N, N, X),
             ))
 
   val cs_is_br = bpd_csignals(0)(0)
@@ -738,7 +734,7 @@ class BranchDecode(implicit p: Parameters) extends BoomModule
   val cs_is_jalr = bpd_csignals(2)(0)
   val cs_is_shadowable = bpd_csignals(3)(0)
   val cs_has_rs2 = bpd_csignals(4)(0)
-  val cs_is_bms = bpd_csignals(5)(0)
+  val cs_is_bms = io.inst === BMS
 
   io.out.is_call := (cs_is_jal || cs_is_jalr) && GetRd(io.inst) === RA
   io.out.is_ret  := cs_is_jalr && GetRs1(io.inst) === BitPat("b00?01") && GetRd(io.inst) === X0
@@ -746,8 +742,6 @@ class BranchDecode(implicit p: Parameters) extends BoomModule
   io.out.target := Mux(cs_is_bms, ComputeBMSTarget(io.pc, io.inst, xLen),
                    Mux(cs_is_br,  ComputeBranchTarget(io.pc, io.inst, xLen),
                                   ComputeJALTarget(io.pc, io.inst, xLen)))
-  io.out.bms_branch := Mux(cs_is_bms, ComputeBMSBranch(io.pc, io.inst, xLen), io.pc)
-  io.out.bms_modifier := io.inst(11, 7)
   io.out.cfi_type :=
     Mux(cs_is_bms,
       CFI_BMS,

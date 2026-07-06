@@ -28,6 +28,7 @@ import freechips.rocketchip.rocket.{PipelinedMultiplier,BP,BreakpointUnit,Causes
 import boom.common._
 import boom.ifu._
 import boom.util._
+import freechips.rocketchip.rocket.Instructions.BMS
 import freechips.rocketchip.rocket.Instructions.BJR
 import freechips.rocketchip.rocket.Instructions.ADDI
 
@@ -392,7 +393,7 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   val is_br          = io.req.valid && !killed && uop.is_br && !uop.is_sfb
   val is_jal         = io.req.valid && !killed && uop.is_jal
   val is_jalr        = io.req.valid && !killed && uop.is_jalr
-  val is_bms         = io.req.valid && !killed && uop.is_bms
+  val is_bms         = io.req.valid && !killed && uop.inst === BMS
   val is_bjr         = io.req.valid && !killed && uop.inst === BJR
 
   when (is_br || is_jalr) {
@@ -406,10 +407,10 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
       mispredict := !uop.taken
     }
 
-    when (mispredict) {
+    when (is_br && mispredict && uop.debug_pc < 0xfffff.U) {
         printf("Mispredict @ %x (%x)\n", uop.debug_pc, uop.inst)
     }
-    when (!mispredict) {
+    when (is_br && !mispredict && uop.debug_pc < 0xfffff.U) {
         printf("Correct prediction @ %x (%x)\n", uop.debug_pc, uop.inst)
     }
   }
@@ -501,33 +502,33 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     //  printf("  uop_pc_next_next: 0x%x\n", uop_pc_next_next)
     //  printf("  uop_pc_next_next_next: 0x%x\n", uop_pc_next_next_next)
     //}
+
+
+    val bjrinfo = Wire(new BjrInfo)
+    bjrinfo.valid := is_bjr
+    bjrinfo.taken := rs1
+
+    val bjr_block_pc = AlignPCToBoundary(io.get_ftq_pc.pc, icBlockBytes)
+    val bjr_pc = (bjr_block_pc | uop.pc_lob) - Mux(uop.edge_inst, 2.U, 0.U)
+
+    val branch_pc = ComputeBJRBranch(bjr_pc, uop.inst, xLen)
+    bjrinfo.branch_pc := branch_pc
+    val branch_block_pc = AlignPCToBoundary(branch_pc, icBlockBytes)
+    bjrinfo.branch_block_pc := branch_block_pc
+
+    val branch_bank = bank(branch_pc)
+    val branch_pc_lob = branch_pc//bankAlign(branch_pc) + (branch_bank.asUInt * bankBytes.U)
+    val branch_cfi_idx = ((branch_pc_lob ^ Mux(branch_bank === 1.U, 1.U << log2Ceil(bankBytes), 0.U)))(log2Ceil(fetchWidth),1)
+    bjrinfo.branch_cfi_idx := branch_cfi_idx
+
+    when (is_bjr) {
+        //printf("Calculated branch_cfi_idx of %d with the following parameters:\n\tbranch_pc: %x\n\tbranch_block_pc: %x\n\tbranch_bank: %d\n\tbranch_pc_lob: %x\n\tbankBytes: %d\n\tfetchWidth: %d\n", branch_cfi_idx, branch_pc, branch_block_pc, branch_bank, branch_pc_lob, bankBytes.U, fetchWidth.U)
+    }
+
+    val target_pc = ComputeBJRBranchTarget(bjr_pc, uop.inst, xLen)
+    bjrinfo.target_pc := Mux(rs1 === true.B, target_pc, branch_pc + 4.U)
+    io.bjrinfo := bjrinfo
   }
-
-
-  val bjrinfo = Wire(new BjrInfo)
-  bjrinfo.valid := is_bjr
-  bjrinfo.taken := rs1
-
-  val bjr_block_pc = AlignPCToBoundary(io.get_ftq_pc.pc, icBlockBytes)
-  val bjr_pc = (bjr_block_pc | uop.pc_lob) - Mux(uop.edge_inst, 2.U, 0.U)
-
-  val branch_pc = ComputeBJRBranch(bjr_pc, uop.inst, xLen)
-  bjrinfo.branch_pc := branch_pc
-  val branch_block_pc = AlignPCToBoundary(branch_pc, icBlockBytes)
-  bjrinfo.branch_block_pc := branch_block_pc
-
-  val branch_bank = bank(branch_pc)
-  val branch_pc_lob = branch_pc//bankAlign(branch_pc) + (branch_bank.asUInt * bankBytes.U)
-  val branch_cfi_idx = ((branch_pc_lob ^ Mux(branch_bank === 1.U, 1.U << log2Ceil(bankBytes), 0.U)))(log2Ceil(fetchWidth),1)
-  bjrinfo.branch_cfi_idx := branch_cfi_idx
-
-  when (is_bjr) {
-    printf("Calculated branch_cfi_idx of %d with the following parameters:\n\tbranch_pc: %x\n\tbranch_block_pc: %x\n\tbranch_bank: %d\n\tbranch_pc_lob: %x\n\tbankBytes: %d\n\tfetchWidth: %d\n", branch_cfi_idx, branch_pc, branch_block_pc, branch_bank, branch_pc_lob, bankBytes.U, fetchWidth.U)
-  }
-
-  val target_pc = ComputeBJRBranchTarget(bjr_pc, uop.inst, xLen)
-  bjrinfo.target_pc := Mux(rs1 === true.B, target_pc, branch_pc + 4.U)
-  io.bjrinfo := bjrinfo
 
 
 // Response

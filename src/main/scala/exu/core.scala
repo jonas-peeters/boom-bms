@@ -1404,10 +1404,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         //   printf("%x", new_ghist(globalHistoryLength-i-1))
         // }
         // printf("\n")
-        printf("%x %x %x %x %x %x\n",
-          rob.io.commit.uops(w).debug_fsrc, rob.io.commit.uops(w).taken,
-          rob.io.commit.uops(w).is_br, rob.io.commit.uops(w).is_jal,
-          rob.io.commit.uops(w).is_jalr, Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen))
+        //printf("%x %x %x %x %x %x\n",
+        //  rob.io.commit.uops(w).debug_fsrc, rob.io.commit.uops(w).taken,
+        //  rob.io.commit.uops(w).is_br, rob.io.commit.uops(w).is_jal,
+        //  rob.io.commit.uops(w).is_jalr, Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen))
 
       }
       new_ghist = Mux(rob.io.commit.arch_valids(w) && rob.io.commit.uops(w).is_br,

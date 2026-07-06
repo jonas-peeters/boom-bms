@@ -228,24 +228,24 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     //    io.update.bits.is_repair_update,
     //    io.update.bits.btb_mispredicts
     //    )
-    printf("{ \"pc\": %x, \"br_mask\": %x, \"is_mispredict_update\": %d, \"is_repair_update\": %d, \"btb_mispredicts\": %x, \"cfi_idx\": { \"valid\": %d, \"bits\": %x }, \"cfi_taken\": %d, \"cfi_mispredicted\": %d, \"cfi_is_br\": %d, \"cfi_is_jal\": %d, \"cfi_is_jalr\": %d, \"ghist\": %x, \"lhist\": [ %x ], \"target\": %x, \"meta\": [ %x ] }\n",
-      io.update.bits.pc,
-      io.update.bits.br_mask,
-      io.update.bits.is_mispredict_update, 
-      io.update.bits.is_repair_update, 
-      io.update.bits.btb_mispredicts,
-      io.update.bits.cfi_idx.valid,
-      io.update.bits.cfi_idx.bits,
-      io.update.bits.cfi_taken, 
-      io.update.bits.cfi_mispredicted, 
-      io.update.bits.cfi_is_br, 
-      io.update.bits.cfi_is_jal, 
-      io.update.bits.cfi_is_jalr,
-      io.update.bits.ghist.asUInt, 
-      io.update.bits.lhist(0),
-      io.update.bits.target, 
-      io.update.bits.meta(0)
-    )
+    //printf("{ \"pc\": %x, \"br_mask\": %x, \"is_mispredict_update\": %d, \"is_repair_update\": %d, \"btb_mispredicts\": %x, \"cfi_idx\": { \"valid\": %d, \"bits\": %x }, //\"cfi_taken\": %d, \"cfi_mispredicted\": %d, \"cfi_is_br\": %d, \"cfi_is_jal\": %d, \"cfi_is_jalr\": %d, \"ghist\": %x, \"lhist\": [ %x ], \"target\": %x, \"meta\": [ //%x ] }\n",
+    //  io.update.bits.pc,
+    //  io.update.bits.br_mask,
+    //  io.update.bits.is_mispredict_update, 
+    //  io.update.bits.is_repair_update, 
+    //  io.update.bits.btb_mispredicts,
+    //  io.update.bits.cfi_idx.valid,
+    //  io.update.bits.cfi_idx.bits,
+    //  io.update.bits.cfi_taken, 
+    //  io.update.bits.cfi_mispredicted, 
+    //  io.update.bits.cfi_is_br, 
+    //  io.update.bits.cfi_is_jal, 
+    //  io.update.bits.cfi_is_jalr,
+    //  io.update.bits.ghist.asUInt, 
+    //  io.update.bits.lhist(0),
+    //  io.update.bits.target, 
+    //  io.update.bits.meta(0)
+    //)
   }
 
   var total_memsize = 0

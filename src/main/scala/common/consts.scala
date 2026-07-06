@@ -77,7 +77,7 @@ trait ScalarOpConstants
   val BR_LTU = 6.U(4.W)  // Branch on Less Than Unsigned
   val BR_J   = 7.U(4.W)  // Jump
   val BR_JR  = 8.U(4.W)  // Jump Register
-  val BR_BMS = 9.U(4.W)  // Branch on Misspeculation
+  val BR_BMS = 9.U(4.W)  // Branch on Misspredition
 
   // RS1 Operand Select Signal
   val OP1_RS1 = 0.U(2.W) // Register Source #1
