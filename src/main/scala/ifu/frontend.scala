@@ -307,6 +307,8 @@ class BrachMissHistoryPrediction(implicit p: Parameters) extends BoomBundle {
 class BranchMissHistoryUpdate(implicit p: Parameters) extends BoomBundle {
   val pc = UInt(vaddrBitsExtended.W)
   val mispredict = Bool()
+  // mask of older, unresolved branches this update speculates under
+  val br_mask = UInt(maxBrCount.W)
 }
 
 class BJRInfo(implicit p: Parameters) extends BoomBundle {
@@ -1349,13 +1351,22 @@ class BoomFrontendModule(outer: BoomFrontend)
 
   // Pipeline the WINNER (not the raw per-ALU inputs) and the ghist
   // snapshot the prediction was made with (see the bjr_ghist fix).
-  val f3_bjr_valid     = RegNext(RegNext(RegNext(bjr_any, false.B), false.B), false.B)
+  // Kill the in-flight retro-prediction if an older branch it speculates
+  // under resolves mispredicted during the 3-cycle window (fix 06): carry
+  // the winner's br_mask through each stage and drop valid on a kill.
+  val s1_bjr_valid = RegNext(bjr_any && !IsKilledByBranch(io.cpu.brupdate, f0_bjr.br_mask), false.B)
+  val s1_bjr_mask  = RegNext(GetNewBrMask(io.cpu.brupdate, f0_bjr.br_mask))
+  val s2_bjr_valid = RegNext(s1_bjr_valid && !IsKilledByBranch(io.cpu.brupdate, s1_bjr_mask), false.B)
+  val s2_bjr_mask  = RegNext(GetNewBrMask(io.cpu.brupdate, s1_bjr_mask))
+  val f3_bjr_valid = RegNext(s2_bjr_valid && !IsKilledByBranch(io.cpu.brupdate, s2_bjr_mask), false.B)
+  val f3_bjr_mask  = RegNext(GetNewBrMask(io.cpu.brupdate, s2_bjr_mask))
   val f3_bjrinfo       = RegNext(RegNext(RegNext(f0_bjr)))
   val f3_bjr_req_ghist = RegNext(RegNext(RegNext(bjr_ghist)))
 
   val bjr_bpd_response = bjr_bpd.io.resp.f3
   when(
-    f3_bjr_valid && bjr_bpd_response.pc === f3_bjrinfo.branch_block_pc
+    f3_bjr_valid && !IsKilledByBranch(io.cpu.brupdate, f3_bjr_mask) &&
+    bjr_bpd_response.pc === f3_bjrinfo.branch_block_pc
   ) {
     bjr_bpd.io.f3_fire := true.B
     val predicted_taken =

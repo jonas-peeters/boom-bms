@@ -202,13 +202,23 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val bmhus = RegInit(VecInit(Seq.fill(coreWidth)(0.U.asTypeOf(Valid(new BranchMissHistoryUpdate())))))
   for ((b, a) <- bmhus zip exe_units.alu_units) {
     b := a.io.bmhu
+    b.valid := a.io.bmhu.valid && !rob.io.flush.valid &&
+               !IsKilledByBranch(brupdate, a.io.bmhu.bits.br_mask)
+    b.bits.br_mask := GetNewBrMask(brupdate, a.io.bmhu.bits.br_mask)
   }
   io.ifu.bmhu := bmhus
+  for (i <- 0 until coreWidth) {
+    // a kill can also arrive during the cycle the update sits here
+    io.ifu.bmhu(i).valid := bmhus(i).valid &&
+      !IsKilledByBranch(brupdate, bmhus(i).bits.br_mask) && !rob.io.flush.valid
+  }
 
-  val bjrinfos = Reg(Vec(coreWidth, new BjrInfo()))
+  val bjrinfos = RegInit(VecInit(Seq.fill(coreWidth)(0.U.asTypeOf(new BjrInfo()))))
   for ((b, a) <- bjrinfos zip exe_units.alu_units) {
     b := a.io.bjrinfo
-    b.valid := a.io.bjrinfo.valid && !rob.io.flush.valid
+    b.valid := a.io.bjrinfo.valid && !rob.io.flush.valid &&
+               !IsKilledByBranch(brupdate, a.io.bjrinfo.br_mask)
+    b.br_mask := GetNewBrMask(brupdate, a.io.bjrinfo.br_mask)
   }
   io.ifu.bjrinfos := bjrinfos
 

@@ -138,6 +138,7 @@ class BjrInfo(implicit p: Parameters) extends BoomBundle
 {
   val valid           = Bool()
   val taken           = Bool()                     // which direction did the branch go?
+  val br_mask         = UInt(maxBrCount.W)         // older unresolved branches this speculates under
 
   val branch_cfi_idx  = UInt(log2Ceil(fetchWidth).W)
   val branch_pc       = UInt(vaddrBitsExtended.W)
@@ -491,6 +492,7 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     io.bmhu.valid := brinfo.valid
     io.bmhu.bits.mispredict := brinfo.mispredict
     io.bmhu.bits.pc := uop_pc
+    io.bmhu.bits.br_mask := GetNewBrMask(io.brupdate, uop)
     //val uop_pc_next = RegNext(uop_pc)
     //val uop_pc_next_next = RegNext(RegNext(uop_pc))
     //val uop_pc_next_next_next = RegNext(RegNext(RegNext(uop_pc)))
@@ -507,6 +509,7 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     val bjrinfo = Wire(new BjrInfo)
     bjrinfo.valid := is_bjr
     bjrinfo.taken := rs1
+    bjrinfo.br_mask := GetNewBrMask(io.brupdate, uop)
 
     val bjr_block_pc = AlignPCToBoundary(io.get_ftq_pc.pc, icBlockBytes)
     val bjr_pc = (bjr_block_pc | uop.pc_lob) - Mux(uop.edge_inst, 2.U, 0.U)
