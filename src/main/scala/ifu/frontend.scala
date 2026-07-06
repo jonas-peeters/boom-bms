@@ -455,14 +455,30 @@ class MultiSourceQueue[T <: Data](
       queues(i).enq.bits := DontCare
     }
     queues(i).deq.ready := false.B
+    // Producers are Valid-typed and cannot be stalled: a full sub-queue
+    // means a silently lost predictor update. Make that loud in sim and
+    // countable in HW.
+    assert(!(io.enq(i).valid && !queues(i).enq.ready),
+      s"MultiSourceQueue: dropped an update from source $i (queue full)")
+  }
+  val dropCount = RegInit(VecInit(Seq.fill(numSources)(0.U(16.W))))
+  for (i <- 0 until numSources) {
+    when(io.enq(i).valid && !queues(i).enq.ready) {
+      dropCount(i) := dropCount(i) + 1.U
+    }
   }
 
+  // Rotate priority each cycle so no source can be starved indefinitely
+  // by a sustained burst from a lower-numbered source.
+  val rr = RegInit(0.U(log2Ceil(numSources).W))
+  rr := Mux(rr === (numSources - 1).U, 0.U, rr + 1.U)
   val selection = Wire(UInt(log2Ceil(numSources + 1).W))
   selection := numSources.asUInt
-
-  for (i <- numSources - 1 to 0 by -1) {
+  for (k <- numSources - 1 to 0 by -1) {
+    val i = Wire(UInt(log2Ceil(numSources).W))
+    i := (rr + k.U) % numSources.U
     when(queues(i).deq.valid) {
-      selection := i.asUInt
+      selection := i
     }
   }
 
@@ -1392,8 +1408,11 @@ class BoomFrontendModule(outer: BoomFrontend)
     // main predictor's history. Virtual outcomes live only in bjr_ghist.
   }
 
+  // entriesPerSource sized for the worst observed burst (BJR completions
+  // at ~1/3 cycles + FTQ updates ~1/2 cycles against a 1/cycle drain);
+  // the in-module assert/counters tell us if 8 is ever insufficient.
   val bpd_update_queue = Module(
-    new MultiSourceQueue(new BranchPredictionUpdate, 3, 3)
+    new MultiSourceQueue(new BranchPredictionUpdate, 3, 8)
   )
   // when (bjr_bpd_update.valid) {
   //  printf("Queueing BJR update\n")
