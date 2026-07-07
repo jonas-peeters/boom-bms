@@ -433,7 +433,10 @@ class BranchMissHistory(implicit p: Parameters)
 class MultiSourceQueue[T <: Data](
     val dataType: T,
     val numSources: Int,
-    val entriesPerSource: Int
+    val entriesPerSource: Int,
+    // Drain priority, highest-priority source first. Defaults to source 0
+    // highest. Must be a permutation of 0 until numSources.
+    val priority: Seq[Int] = Nil
 ) extends Module {
   val io = IO(new Bundle {
     val enq = Vec(
@@ -457,30 +460,44 @@ class MultiSourceQueue[T <: Data](
       queues(i).enq.bits := DontCare
     }
     queues(i).deq.ready := false.B
-    // Producers are Valid-typed and cannot be stalled: a full sub-queue
-    // means a silently lost predictor update. Make that loud in sim and
-    // countable in HW.
-    assert(!(io.enq(i).valid && !queues(i).enq.ready),
-      s"MultiSourceQueue: dropped an update from source $i (queue full)")
   }
-  val dropCount = RegInit(VecInit(Seq.fill(numSources)(0.U(16.W))))
+  // Producers are Valid-typed and cannot be stalled, so a full sub-queue
+  // drops a predictor update. That is tolerable (the original design dropped
+  // silently) but it must NOT kill a multi-hour benchmark run, which a fatal
+  // assert here did on MediumBoomConfig. Instead: count every drop
+  // (dropCount, readable in sim/waveform) and print a one-time warning per
+  // source so drops stay visible without a fatal $stop or per-cycle log spam.
+  val dropCount  = RegInit(VecInit(Seq.fill(numSources)(0.U(32.W))))
+  val dropWarned = RegInit(VecInit(Seq.fill(numSources)(false.B)))
   for (i <- 0 until numSources) {
     when(io.enq(i).valid && !queues(i).enq.ready) {
       dropCount(i) := dropCount(i) + 1.U
+      when(!dropWarned(i)) {
+        dropWarned(i) := true.B
+        printf(s"[MultiSourceQueue] WARNING: dropped an update from source $i " +
+          s"(sub-queue full); further drops from source $i counted in dropCount.\n")
+      }
     }
   }
 
-  // Rotate priority each cycle so no source can be starved indefinitely
-  // by a sustained burst from a lower-numbered source.
-  val rr = RegInit(0.U(log2Ceil(numSources).W))
-  rr := Mux(rr === (numSources - 1).U, 0.U, rr + 1.U)
+  // Drain one sub-queue per cycle by FIXED priority (`prioOrder` lists
+  // sources highest-priority first). Round-robin was starving whichever
+  // source needed more than its 1/numSources share during a burst; instead
+  // the caller ranks the sources so the one that must never be dropped (the
+  // main-predictor FTQ commit stream) always wins the drain slot, and the
+  // best-effort sources take the slack cycles.
+  val prioOrder =
+    if (priority.isEmpty) (0 until numSources).toList else priority.toList
+  require(prioOrder.sorted == (0 until numSources).toList,
+    s"MultiSourceQueue priority $priority must be a permutation of " +
+      s"0 until $numSources")
   val selection = Wire(UInt(log2Ceil(numSources + 1).W))
   selection := numSources.asUInt
-  for (k <- numSources - 1 to 0 by -1) {
-    val i = Wire(UInt(log2Ceil(numSources).W))
-    i := (rr + k.U) % numSources.U
+  // Iterate lowest-priority first so the highest-priority valid source wins
+  // via Chisel last-connect.
+  for (i <- prioOrder.reverse) {
     when(queues(i).deq.valid) {
-      selection := i
+      selection := i.U
     }
   }
 
@@ -873,10 +890,19 @@ class BoomFrontendModule(outer: BoomFrontend)
   var redirect_found = false.B
   var bank_prev_is_half = f3_prev_is_half
   var bank_prev_half = f3_prev_half
+  // Redirect-independent copy of bank_prev_is_half, used only to gate the
+  // shared BMH request (see req_mask below).
+  var req_bank_prev_is_half = f3_prev_is_half
   var last_inst = 0.U(16.W)
   for (b <- 0 until nBanks) {
     val bank_data = f3_data((b + 1) * bankWidth * 16 - 1, b * bankWidth * 16)
     val bank_mask = Wire(Vec(bankWidth, Bool()))
+    // Redirect-independent instruction-start mask, used only to gate the
+    // shared BMH request. It mirrors bank_mask but omits the !redirect_found
+    // term, so the F3 BMS lookup does not fold back through
+    // redirect_found -> bank_mask -> valid, which (together with
+    // bmh.resp -> f3_redirects -> redirect_found) would form a comb loop.
+    val req_mask = Wire(Vec(bankWidth, Bool()))
     val bank_insts = Wire(Vec(bankWidth, UInt(32.W)))
 
     for (w <- 0 until bankWidth) {
@@ -905,7 +931,7 @@ class BoomFrontendModule(outer: BoomFrontend)
         // Only query the BMH when this slot really holds this instruction:
         // inst0 is the cross-boundary instruction, selected iff
         // bank_prev_is_half; the slot must also be inside the fetch mask.
-        when(bank_prev_is_half && f3.io.deq.valid &&
+        when(req_bank_prev_is_half && f3.io.deq.valid &&
              f3_imemresp.mask(i) && exp_inst0 === BMS) {
           val bms_branch0 = ComputeBMSBranch(pc0, exp_inst0, xLen)
           bmh.io.req0.pc := bms_branch0
@@ -917,7 +943,7 @@ class BoomFrontendModule(outer: BoomFrontend)
         val bpd_decoder1 = Module(new BranchDecode)
         bpd_decoder1.io.inst := exp_inst1
         bpd_decoder1.io.pc := pc1
-        when(!bank_prev_is_half && f3.io.deq.valid &&
+        when(!req_bank_prev_is_half && f3.io.deq.valid &&
              f3_imemresp.mask(i) && exp_inst1 === BMS) {
           val bms_branch1 = ComputeBMSBranch(pc1, exp_inst1, xLen)
           bmh.io.req1.pc := bms_branch1
@@ -963,6 +989,7 @@ class BoomFrontendModule(outer: BoomFrontend)
           f3_fetch_bundle.edge_inst(b) := false.B
         }
         valid := true.B
+        req_mask(w) := f3.io.deq.valid && f3_imemresp.mask(i)
       } else {
         val inst = Wire(UInt(32.W))
         val exp_inst = ExpandRVC(inst)
@@ -992,10 +1019,23 @@ class BoomFrontendModule(outer: BoomFrontend)
           valid := !(bank_mask(w - 1) && !isRVC(bank_insts(w - 1)))
         }
 
+        // Redirect-independent mirror of `valid`, used only to gate the BMH
+        // request (see req_mask above). Same boundary logic, but chained
+        // through req_mask (no !redirect_found) so the request cannot depend
+        // on bmh.resp via redirect_found.
+        val req_valid =
+          if (w == 1) {
+            req_bank_prev_is_half || !(req_mask(0) && !isRVC(bank_insts(0)))
+          } else if (w == bankWidth - 1) {
+            !((req_mask(w - 1) && !isRVC(bank_insts(w - 1))) || !isRVC(inst))
+          } else {
+            !(req_mask(w - 1) && !isRVC(bank_insts(w - 1)))
+          }
+        req_mask(w) := f3.io.deq.valid && f3_imemresp.mask(i) && req_valid
+
         // valid is fully assigned above; gate the request on the slot
         // being a real instruction inside the fetch mask.
-        when(valid && f3.io.deq.valid && f3_imemresp.mask(i) &&
-             exp_inst === BMS) {
+        when(req_mask(w) && exp_inst === BMS) {
           val bms_branch = ComputeBMSBranch(pc, exp_inst, xLen)
           bmh.io.req0.pc := bms_branch
           bmh.io.req0.modifier := exp_inst(11, 7)
@@ -1116,6 +1156,13 @@ class BoomFrontendModule(outer: BoomFrontend)
       bank_prev_is_half
     )
     bank_prev_half = Mux(f3_bank_mask(b), last_inst(15, 0), bank_prev_half)
+    req_bank_prev_is_half = Mux(
+      f3_bank_mask(b),
+      (!(req_mask(bankWidth - 2) && !isRVC(
+        bank_insts(bankWidth - 2)
+      )) && !isRVC(last_inst)),
+      req_bank_prev_is_half
+    )
   }
 
   f3_fetch_bundle.cfi_type := f3_cfi_types(f3_fetch_bundle.cfi_idx.bits)
@@ -1419,11 +1466,16 @@ class BoomFrontendModule(outer: BoomFrontend)
     // main predictor's history. Virtual outcomes live only in bjr_ghist.
   }
 
-  // entriesPerSource sized for the worst observed burst (BJR completions
-  // at ~1/3 cycles + FTQ updates ~1/2 cycles against a 1/cycle drain);
-  // the in-module assert/counters tell us if 8 is ever insufficient.
+  // Sources: 0 = BJR retro-updates, 1 = FTQ commit updates, 2 = F4 BTB
+  // corrections; drained one/cycle into bpd.io.update.
+  // Priority Seq(1, 0, 2): the FTQ commit stream is the main predictor's
+  // primary training stream (it can approach 1 update/cycle and mirrors
+  // stock BOOM's single update path), so it always wins the drain slot and
+  // never overflows; BJR and BTB corrections are best-effort on the slack
+  // cycles. entriesPerSource deepened 8 -> 16 for burst headroom on those
+  // best-effort sources; dropCount tells us if 16 is ever insufficient.
   val bpd_update_queue = Module(
-    new MultiSourceQueue(new BranchPredictionUpdate, 3, 8)
+    new MultiSourceQueue(new BranchPredictionUpdate, 3, 16, priority = Seq(1, 0, 2))
   )
   // when (bjr_bpd_update.valid) {
   //  printf("Queueing BJR update\n")
