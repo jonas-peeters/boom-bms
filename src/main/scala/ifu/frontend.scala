@@ -904,6 +904,20 @@ class BoomFrontendModule(outer: BoomFrontend)
     // bmh.resp -> f3_redirects -> redirect_found) would form a comb loop.
     val req_mask = Wire(Vec(bankWidth, Bool()))
     val bank_insts = Wire(Vec(bankWidth, UInt(32.W)))
+    // Redirect-independent mirror of bank_insts(0) (the only slot whose
+    // *content selection* depends on redirect_found, via bank_prev_is_half
+    // for b > 0). Slots w >= 1 are pure bank_data slices and need no mirror.
+    // Assigned in the w == 0 iteration below.
+    val req_bank_inst0 = Wire(UInt(32.W))
+    // redirect_found as of the start of this bank — premise for the
+    // shadow-equivalence assertions below (shadow may legitimately diverge
+    // on slots after a redirect; those slots are squashed anyway).
+    val bank_redirect_before = redirect_found
+    assert(
+      bank_redirect_before || (req_bank_prev_is_half === bank_prev_is_half),
+      "BMS req shadow: req_bank_prev_is_half diverged from " +
+        "bank_prev_is_half with no earlier redirect"
+    )
 
     for (w <- 0 until bankWidth) {
       val i = (b * bankWidth) + w
@@ -928,16 +942,39 @@ class BoomFrontendModule(outer: BoomFrontend)
         val bpd_decoder0 = Module(new BranchDecode)
         bpd_decoder0.io.inst := exp_inst0
         bpd_decoder0.io.pc := pc0
+
+        // Redirect-independent view of this bank's slot-0 instruction, for
+        // the BMH request path only. Mirrors the bank_insts(0) selection
+        // below, but muxed by req_bank_prev_is_half / f3_bank_mask (both
+        // redirect-independent; f3_bank_mask is a pure function of the
+        // fetch PC, line 857) instead of bank_prev_is_half, which for b > 0
+        // folds in redirect_found via the previous bank's bank_mask and
+        // would close the comb loop bmh.req -> bmh.resp -> f3_redirects ->
+        // bank_mask -> bank_insts(0) -> req_valid -> bmh.req on multi-bank
+        // (Large/Mega) configs. The cross-boundary half-word comes from the
+        // previous bank (last_inst, a pure slice of that bank's data) when
+        // that bank was fetched, else from the previous packet
+        // (f3_prev_half).
+        val req_cross_inst =
+          if (b == 0) inst0
+          else Mux(f3_bank_mask(b - 1),
+                   Cat(bank_data(15, 0), last_inst), inst0)
+        val req_cross_exp = ExpandRVC(req_cross_inst)
+        req_bank_inst0 := Mux(req_bank_prev_is_half, req_cross_inst, inst1)
+
         // Only query the BMH when this slot really holds this instruction:
-        // inst0 is the cross-boundary instruction, selected iff
-        // bank_prev_is_half; the slot must also be inside the fetch mask.
+        // the cross-boundary candidate is selected iff
+        // req_bank_prev_is_half; the slot must also be inside the fetch
+        // mask. Decode from req_cross_inst so that for b > 0 the true
+        // cross-BANK bytes (last_inst) are checked, not the stale
+        // cross-packet half-word.
         when(req_bank_prev_is_half && f3.io.deq.valid &&
-             f3_imemresp.mask(i) && exp_inst0 === BMS) {
-          val bms_branch0 = ComputeBMSBranch(pc0, exp_inst0, xLen)
+             f3_imemresp.mask(i) && req_cross_exp === BMS) {
+          val bms_branch0 = ComputeBMSBranch(pc0, req_cross_exp, xLen)
           bmh.io.req0.pc := bms_branch0
-          bmh.io.req0.modifier := exp_inst0(11, 7)
+          bmh.io.req0.modifier := req_cross_exp(11, 7)
           bmh.io.req0.valid := true.B
-          printf("BranchMissHistoryRequest0: pc: %x, branch %x, modifier %x\n", pc0, bms_branch0, exp_inst0(11, 7))
+          printf("BranchMissHistoryRequest0: pc: %x, branch %x, modifier %x\n", pc0, bms_branch0, req_cross_exp(11, 7))
         }
 
         val bpd_decoder1 = Module(new BranchDecode)
@@ -990,6 +1027,11 @@ class BoomFrontendModule(outer: BoomFrontend)
         }
         valid := true.B
         req_mask(w) := f3.io.deq.valid && f3_imemresp.mask(i)
+        assert(
+          bank_redirect_before || (req_bank_inst0 === bank_insts(w)),
+          "BMS req shadow: req_bank_inst0 diverged from bank_insts(0) " +
+            "with no earlier redirect"
+        )
       } else {
         val inst = Wire(UInt(32.W))
         val exp_inst = ExpandRVC(inst)
@@ -1021,11 +1063,13 @@ class BoomFrontendModule(outer: BoomFrontend)
 
         // Redirect-independent mirror of `valid`, used only to gate the BMH
         // request (see req_mask above). Same boundary logic, but chained
-        // through req_mask (no !redirect_found) so the request cannot depend
-        // on bmh.resp via redirect_found.
+        // through req_mask (no !redirect_found) and req_bank_inst0 (slot 0
+        // is the only slot whose bytes are selected by a redirect-dependent
+        // mux; slots >= 1 are pure bank_data slices, shared with `valid`),
+        // so the request cannot depend on bmh.resp via redirect_found.
         val req_valid =
           if (w == 1) {
-            req_bank_prev_is_half || !(req_mask(0) && !isRVC(bank_insts(0)))
+            req_bank_prev_is_half || !(req_mask(0) && !isRVC(req_bank_inst0))
           } else if (w == bankWidth - 1) {
             !((req_mask(w - 1) && !isRVC(bank_insts(w - 1))) || !isRVC(inst))
           } else {
@@ -1056,6 +1100,17 @@ class BoomFrontendModule(outer: BoomFrontend)
       f3_mask(i) := f3.io.deq.valid && f3_imemresp.mask(
         i
       ) && valid && !redirect_found
+      // Shadow-equivalence check: with no redirect at any earlier slot
+      // (`redirect_found` here is the pre-slot-w value, the same term
+      // bank_mask(w) uses), the redirect-independent request mask must
+      // agree with the architectural instruction-start mask. Proven
+      // combinationally in fixes/formal/bms_req_shadow_proof.py; asserted
+      // here so every simulation revalidates it on the real netlist.
+      assert(
+        redirect_found || (req_mask(w) === bank_mask(w)),
+        "BMS req shadow: req_mask diverged from bank_mask " +
+          "with no earlier redirect"
+      )
       f3_targs(i) := Mux(
         brsigs.cfi_type === CFI_JALR,
         f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.bits,
@@ -1156,10 +1211,15 @@ class BoomFrontendModule(outer: BoomFrontend)
       bank_prev_is_half
     )
     bank_prev_half = Mux(f3_bank_mask(b), last_inst(15, 0), bank_prev_half)
+    // Shadow of the bank_prev_is_half update above: req_mask in place of
+    // bank_mask, and (for bankWidth == 2, where slot bankWidth-2 is slot 0)
+    // req_bank_inst0 in place of the redirect-dependent bank_insts(0).
+    // last_inst is a pure slice of bank_data and f3_bank_mask is a pure
+    // function of the fetch PC, so this stays redirect-independent.
     req_bank_prev_is_half = Mux(
       f3_bank_mask(b),
       (!(req_mask(bankWidth - 2) && !isRVC(
-        bank_insts(bankWidth - 2)
+        if (bankWidth == 2) req_bank_inst0 else bank_insts(bankWidth - 2)
       )) && !isRVC(last_inst)),
       req_bank_prev_is_half
     )
