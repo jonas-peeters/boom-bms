@@ -282,6 +282,20 @@ class FetchBundle(implicit p: Parameters)
 
   val end_half = Valid(UInt(16.W))
 
+  // --- BMS + branch macro-op fusion (alternative 1b) metadata ---
+  // All-zero unless enableBmsFusion and the +bms_fusion_enable plusarg are on.
+  // Slot i holds a BMS that fuses with the conditional branch at slot i+2;
+  // the fetch buffer drops these BMS slots at enqueue.
+  val bms_fuse_mask = Vec(fetchWidth, Bool())
+  // This packet's CFI is a fused branch for which the BMH chose the
+  // branch-free path (recorded prediction: taken -> branch-free target).
+  val bms_fused_cfi = Bool()
+  // Direction the main BPD predicted for that branch at fetch time.
+  val bms_bpd_taken = Bool()
+  // Architectural (PC + B-imm) target of the fused branch, used to train
+  // the BPD/BTB with the would-be outcome instead of the branch-free target.
+  val bms_arch_target = UInt(vaddrBitsExtended.W)
+
   val bpd_meta = Vec(nBanks, UInt())
 
   // Source of the prediction from this bundle
@@ -320,6 +334,17 @@ class BranchMissHistoryRequest(implicit p: Parameters) extends BoomBundle {
   val pc = UInt(vaddrBitsExtended.W)
   val modifier = UInt(5.W)
   val valid = Bool()
+}
+
+// Resolution report for a fused bms_mode branch (alternative 1b): carries
+// the would-be outcome from the ALU to the FTQ so the main BPD trains
+// through its normal update path (no BJR retro-prediction needed).
+class BmsResolveInfo(implicit p: Parameters) extends BoomBundle {
+  val ftq_idx      = UInt(log2Ceil(ftqSz).W)
+  // Would-be outcome: the evaluated branch condition.
+  val taken        = Bool()
+  // Would-be direction mispredict vs. the BPD's fetch-time prediction.
+  val mispredicted = Bool()
 }
 
 class BranchMissHistory(implicit p: Parameters)
@@ -548,6 +573,9 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle {
 
   val bmhu = Output(Vec(coreWidth, Valid(new BranchMissHistoryUpdate)))
   val bjrinfos = Output(Vec(coreWidth, new BjrInfo))
+  // Resolutions of fused bms_mode branches (alternative 1b). Inert unless
+  // enableBmsFusion is set.
+  val bms_resolves = Output(Vec(coreWidth, Valid(new BmsResolveInfo)))
 }
 
 /** Top level Frontend class
@@ -610,6 +638,17 @@ class BoomFrontendModule(outer: BoomFrontend)
   // BMS in ANY slot survives last-connect (no .otherwise clobber).
   bmh.io.req0.valid := false.B
   bmh.io.req1.valid := false.B
+
+  // Alternative 1b runtime switch: when the fusion datapath is elaborated,
+  // +bms_fusion_enable=0 falls back to the legacy (separate BMS redirect +
+  // BJR retro-training) behavior at runtime for A/B comparison on one
+  // binary. Constant false when the datapath is not elaborated.
+  val bmsFusionOn = if (enableBmsFusion) {
+    PlusArg("bms_fusion_enable", default = 1,
+      docstring = "Enable BMS+branch macro-op fusion (0 = legacy BMS/BJR)") =/= 0.U
+  } else {
+    false.B
+  }
 
   val ras = Module(new BoomRAS)
 
@@ -1225,6 +1264,72 @@ class BoomFrontendModule(outer: BoomFrontend)
     )
   }
 
+  // ------------------------------------------------------------------
+  // BMS + branch macro-op fusion (alternative 1b).
+  //
+  // A BMS at slot i whose branch-offset field encodes +4 pairs with the
+  // 32-bit conditional branch at slot i+2 (a 32-bit BMS occupies two
+  // 16-bit parcels). When the BMH says "likely mispredicted", the *branch*
+  // is recorded as predicted taken with the BMS's branch-free target; the
+  // BMS itself never redirects in fusion mode. The fetch buffer later
+  // drops the fused BMS slots and tags the branch uop with bms_mode.
+  //
+  // Unsupported shapes fall back safely (BMS behaves as a NOP, the branch
+  // as a plain branch): pairs split across fetch packets or non-fetched
+  // banks, cross-boundary (edge) BMSs, compressed or non-branch partners,
+  // and BMS branch-offset fields other than +4.
+  //
+  // Comb-loop note (cf. fix-12): the overrides below read bmh.io.resp*,
+  // f3_mask / exp_insts of slot i, and f3_cfi_types / f3_is_rvc of slot
+  // i+2 — all functions of bmh responses and of redirects at slots
+  // *before* the overridden slot i+2. The BMH request path is driven only
+  // by the redirect-independent shadow, so no cycle closes.
+  val f3_bms_fuse = WireInit(VecInit(Seq.fill(fetchWidth)(false.B)))
+  f3_fetch_bundle.bms_fuse_mask := f3_bms_fuse
+  f3_fetch_bundle.bms_fused_cfi := false.B
+  f3_fetch_bundle.bms_bpd_taken := false.B
+  f3_fetch_bundle.bms_arch_target := 0.U
+  if (enableBmsFusion) {
+    // In fusion mode the BMS slot itself must never redirect (the legacy
+    // CFI_BMS redirect in the slot loop is replaced by the fused-branch
+    // redirect below).
+    for (i <- 0 until fetchWidth) {
+      when(bmsFusionOn && f3_mask(i) && f3_cfi_types(i) === CFI_BMS) {
+        f3_redirects(i) := false.B
+      }
+    }
+    for (i <- 0 until fetchWidth - 2) {
+      val b = i / bankWidth
+      val w = i % bankWidth
+      val inst_i = f3_fetch_bundle.exp_insts(i)
+      val pc_i = f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U
+      val pc_br = f3_aligned_pc + ((i + 2) << log2Ceil(coreInstBytes)).U
+      // Only straight (non-edge) BMS slots are supported; the BMH request
+      // for those was issued on req1 (bank-start slots) or req0 (others),
+      // mirroring the request wiring in the slot loop above.
+      val not_edge = if (w == 0) !f3_fetch_bundle.edge_inst(b) else true.B
+      val bms_resp = if (w == 0) bmh.io.resp1 else bmh.io.resp0
+      val is_fusable_bms = f3_mask(i) && not_edge && inst_i === BMS &&
+        inst_i(31, 24) === 2.U // branch-offset field must encode +4
+      val partner_ok = f3_mask(i + 2) && !f3_is_rvc(i + 2) &&
+        f3_cfi_types(i + 2) === CFI_BR
+      when(bmsFusionOn && is_fusable_bms && partner_ok) {
+        f3_bms_fuse(i) := true.B
+        when(bms_resp.valid && bms_resp.bits && useBPD.B) {
+          f3_redirects(i + 2) := true.B
+          f3_targs(i + 2) := ComputeBMSTarget(pc_i, inst_i, xLen)
+          f3_fetch_bundle.bms_fused_cfi := true.B
+          f3_fetch_bundle.bms_bpd_taken :=
+            f3_bpd_resp.io.deq.bits.preds(i + 2).taken
+          f3_fetch_bundle.bms_arch_target :=
+            ComputeBranchTarget(pc_br, f3_fetch_bundle.exp_insts(i + 2), xLen)
+          printf("BMS fusion: branch-free redirect for branch @ %x -> %x\n",
+            pc_br, ComputeBMSTarget(pc_i, inst_i, xLen))
+        }
+      }
+    }
+  }
+
   f3_fetch_bundle.cfi_type := f3_cfi_types(f3_fetch_bundle.cfi_idx.bits)
   f3_fetch_bundle.cfi_is_call := f3_call_mask(f3_fetch_bundle.cfi_idx.bits)
   f3_fetch_bundle.cfi_is_ret := f3_ret_mask(f3_fetch_bundle.cfi_idx.bits)
@@ -1599,6 +1704,7 @@ class BoomFrontendModule(outer: BoomFrontend)
   io.cpu.get_pc <> ftq.io.get_ftq_pc
   ftq.io.deq := io.cpu.commit
   ftq.io.brupdate := io.cpu.brupdate
+  ftq.io.bms_resolves := io.cpu.bms_resolves
 
   ftq.io.redirect.valid := io.cpu.redirect_val
   ftq.io.redirect.bits := io.cpu.redirect_ftq_idx

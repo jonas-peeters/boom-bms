@@ -80,6 +80,19 @@ class WithRationalBoomTiles extends Config((site, here, up) => {
 })
 
 /**
+ * Elaborate the BMS+branch macro-op fusion datapath (alternative 1b) in all
+ * BOOM tiles. The legacy BMS/BJR path stays functional; at runtime
+ * +bms_fusion_enable=0 selects it on the same binary.
+ */
+class WithBmsFusion extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(
+      core = tp.tileParams.core.copy(enableBmsFusion = true)))
+    case other => other
+  }
+})
+
+/**
  * 1-wide BOOM.
  */
 class WithNSmallBooms(n: Int = 1) extends Config(

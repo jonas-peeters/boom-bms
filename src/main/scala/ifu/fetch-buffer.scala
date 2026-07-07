@@ -95,7 +95,10 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
       val pc = (bankAlign(io.enq.bits.pc) + (i << 1).U)
 
       in_uops(i)                := DontCare
-      in_mask(i)                := io.enq.valid && io.enq.bits.mask(i)
+      // Drop BMS slots that fused with their adjacent branch (alternative
+      // 1b); the pair is represented solely by the branch uop.
+      in_mask(i)                := io.enq.valid && io.enq.bits.mask(i) &&
+                                   !(enableBmsFusion.B && io.enq.bits.bms_fuse_mask(i))
       in_uops(i).edge_inst      := false.B
       in_uops(i).debug_pc       := pc
       in_uops(i).pc_lob         := pc
@@ -114,6 +117,11 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
       in_uops(i).debug_inst     := io.enq.bits.insts(i)
       in_uops(i).is_rvc         := io.enq.bits.insts(i)(1,0) =/= 3.U
       in_uops(i).taken          := io.enq.bits.cfi_idx.bits === i.U && io.enq.bits.cfi_idx.valid
+      // Tag the fused branch uop (alternative 1b): bms_mode marks that the
+      // front end chose the branch-free path for this branch.
+      in_uops(i).bms_mode       := enableBmsFusion.B && io.enq.bits.bms_fused_cfi &&
+                                   io.enq.bits.cfi_idx.valid && io.enq.bits.cfi_idx.bits === i.U
+      in_uops(i).bms_bpd_taken  := io.enq.bits.bms_bpd_taken
 
       in_uops(i).xcpt_pf_if     := io.enq.bits.xcpt_pf_if
       in_uops(i).xcpt_ae_if     := io.enq.bits.xcpt_ae_if

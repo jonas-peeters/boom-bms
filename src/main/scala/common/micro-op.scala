@@ -71,6 +71,15 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   // Was this a branch that was predicted taken?
   val taken            = Bool()
 
+  // BMS fusion (alternative 1b): this uop is a conditional branch that was
+  // fused with a preceding BMS and for which the front end chose the
+  // branch-free path (predicted taken -> branch-free target). Its resolution
+  // must never redirect; the condition only trains BMH/BPD (would-be outcome).
+  val bms_mode         = Bool()
+  // Direction the main BPD would have predicted for this branch at fetch
+  // time (used to derive the would-be misprediction for BMH training).
+  val bms_bpd_taken    = Bool()
+
   val imm_packed       = UInt(LONGEST_IMM_SZ.W) // densely pack the imm in decode...
                                               // then translate and sign-extend in execute
   val csr_addr         = UInt(CSR_ADDR_SZ.W)    // only used for critical path reasons in Exe

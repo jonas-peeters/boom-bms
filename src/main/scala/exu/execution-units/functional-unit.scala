@@ -396,6 +396,9 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   val is_jalr        = io.req.valid && !killed && uop.is_jalr
   val is_bms         = io.req.valid && !killed && uop.inst === BMS
   val is_bjr         = io.req.valid && !killed && uop.inst === BJR
+  // Alternative 1b: conditional branch fused with a preceding BMS for which
+  // the front end chose the branch-free path.
+  val is_bms_fused   = enableBmsFusion.B && is_br && uop.bms_mode
 
   when (is_br || is_jalr) {
     if (!isJmpUnit) {
@@ -414,6 +417,14 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     when (is_br && !mispredict && uop.debug_pc < 0xfffff.U) {
         printf("Correct prediction @ %x (%x)\n", uop.debug_pc, uop.inst)
     }
+  }
+
+  // Alternative 1b: for a fused bms_mode branch the fetch-time decision is
+  // ground truth (like the legacy BR_BMS rule) — its resolution never
+  // redirects. The condition is still evaluated (is_taken / brinfo.taken)
+  // and only trains the BMH and, via the FTQ, the BPD.
+  when (is_bms_fused) {
+    mispredict := false.B
   }
 
   val brinfo = Wire(new BrResolutionInfo)
@@ -497,7 +508,11 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     //  - not BMS itself (never mispredicts by construction; would only
     //    burn a table slot next to the branch it guards).
     io.bmhu.valid := is_br && uop.inst =/= BMS
-    io.bmhu.bits.mispredict := brinfo.mispredict
+    // For fused bms_mode branches the architectural mispredict is forced
+    // false; train the BMH with the would-be direction mispredict instead
+    // (the BPD's fetch-time prediction vs. the evaluated condition).
+    io.bmhu.bits.mispredict := Mux(is_bms_fused,
+      uop.bms_bpd_taken =/= (pc_sel === PC_BRJMP), brinfo.mispredict)
     io.bmhu.bits.pc := uop_pc
     io.bmhu.bits.br_mask := GetNewBrMask(io.brupdate, uop)
     //val uop_pc_next = RegNext(uop_pc)

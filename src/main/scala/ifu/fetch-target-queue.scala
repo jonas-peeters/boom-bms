@@ -59,6 +59,10 @@ class FTQBundle(implicit p: Parameters) extends BoomBundle
   val cfi_is_ret    = Bool()
   // Is the NPC after the CFI +4 or +2
   val cfi_npc_plus4 = Bool()
+  // The CFI is a fused bms_mode branch (alternative 1b): the recorded
+  // prediction is "taken -> branch-free target", and the BPD update must
+  // use the would-be outcome / architectural target side state instead.
+  val cfi_is_bms_fused = Bool()
   // What was the top of the RAS that this bundle saw?
   val ras_top = UInt(vaddrBitsExtended.W)
   val ras_idx = UInt(log2Ceil(nRasEntries).W)
@@ -123,6 +127,10 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
     val brupdate = Input(new BrUpdateInfo)
 
+    // Would-be outcomes of fused bms_mode branches (alternative 1b),
+    // reported at resolution. Inert unless enableBmsFusion.
+    val bms_resolves = Input(Vec(coreWidth, Valid(new BmsResolveInfo)))
+
     val bpdupdate = Output(Valid(new BranchPredictionUpdate))
 
     val ras_update = Output(Bool())
@@ -139,6 +147,12 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
 
   val pcs      = Reg(Vec(num_entries, UInt(vaddrBitsExtended.W)))
+  // Side state for fused bms_mode branches (alternative 1b): would-be
+  // outcome and architectural target for BPD training. Kept outside the
+  // FTQBundle so repair paths keep replaying the *recorded* prediction.
+  val bms_taken   = Reg(Vec(num_entries, Bool()))
+  val bms_mispred = Reg(Vec(num_entries, Bool()))
+  val bms_targets = Reg(Vec(num_entries, UInt(vaddrBitsExtended.W)))
   val meta     = SyncReadMem(num_entries, Vec(nBanks, UInt(bpdMaxMetaLength.W)))
   val ram      = Reg(Vec(num_entries, new FTQBundle))
   val ghist    = Seq.fill(2) { SyncReadMem(num_entries, new GlobalHistory) }
@@ -170,6 +184,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     new_entry.cfi_is_call   := io.enq.bits.cfi_is_call
     new_entry.cfi_is_ret    := io.enq.bits.cfi_is_ret
     new_entry.cfi_npc_plus4 := io.enq.bits.cfi_npc_plus4
+    new_entry.cfi_is_bms_fused := io.enq.bits.bms_fused_cfi
     new_entry.ras_top       := io.enq.bits.ras_top
     new_entry.ras_idx       := io.enq.bits.ghist.ras_idx
     new_entry.br_mask       := io.enq.bits.br_mask & io.enq.bits.mask
@@ -198,7 +213,21 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     prev_entry := new_entry
     prev_ghist := new_ghist
 
+    // Until the fused branch resolves, the side state mirrors the recorded
+    // prediction (taken -> arch target known already at fetch).
+    bms_taken(enq_ptr)   := true.B
+    bms_mispred(enq_ptr) := false.B
+    bms_targets(enq_ptr) := io.enq.bits.bms_arch_target
+
     enq_ptr := WrapInc(enq_ptr, num_entries)
+  }
+
+  // Record would-be outcomes of fused bms_mode branches at resolution.
+  for (r <- io.bms_resolves) {
+    when (r.valid) {
+      bms_taken(r.bits.ftq_idx)   := r.bits.taken
+      bms_mispred(r.bits.ftq_idx) := r.bits.mispredicted
+    }
   }
 
   io.enq_idx := enq_ptr
@@ -241,6 +270,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val bpd_meta  = meta.read(bpd_idx, true.B) // TODO fix these SRAMs
   val bpd_pc    = RegNext(pcs(bpd_idx))
   val bpd_target = RegNext(pcs(WrapInc(bpd_idx, num_entries)))
+  val bpd_bms_taken   = RegNext(bms_taken(bpd_idx))
+  val bpd_bms_mispred = RegNext(bms_mispred(bpd_idx))
+  val bpd_bms_target  = RegNext(bms_targets(bpd_idx))
 
   when (io.redirect.valid) {
     bpd_update_mispredict := false.B
@@ -289,9 +321,17 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.br_mask := Mux(bpd_entry.cfi_idx.valid,
       MaskLower(UIntToOH(cfi_idx)) & bpd_entry.br_mask, bpd_entry.br_mask)
     io.bpdupdate.bits.cfi_idx := bpd_entry.cfi_idx
-    io.bpdupdate.bits.cfi_mispredicted := bpd_entry.cfi_mispredicted
-    io.bpdupdate.bits.cfi_taken  := bpd_entry.cfi_taken
-    io.bpdupdate.bits.target     := bpd_target
+    // For fused bms_mode branches (alternative 1b), train with the
+    // would-be outcome and the architectural branch target instead of the
+    // recorded prediction (which is "taken -> branch-free target"). The
+    // ghist snapshot deliberately keeps the fetch-time taken bit: the
+    // update trains against the history the predictor actually saw.
+    io.bpdupdate.bits.cfi_mispredicted := Mux(bpd_entry.cfi_is_bms_fused,
+      bpd_bms_mispred, bpd_entry.cfi_mispredicted)
+    io.bpdupdate.bits.cfi_taken  := Mux(bpd_entry.cfi_is_bms_fused,
+      bpd_bms_taken, bpd_entry.cfi_taken)
+    io.bpdupdate.bits.target     := Mux(bpd_entry.cfi_is_bms_fused,
+      bpd_bms_target, bpd_target)
     io.bpdupdate.bits.cfi_is_br  := bpd_entry.br_mask(cfi_idx)
     io.bpdupdate.bits.cfi_is_jal := bpd_entry.cfi_type === CFI_JAL || bpd_entry.cfi_type === CFI_JALR
     io.bpdupdate.bits.ghist      := bpd_ghist
@@ -321,6 +361,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       redirect_new_entry.cfi_idx.bits     := new_cfi_idx
       redirect_new_entry.cfi_mispredicted := true.B
       redirect_new_entry.cfi_taken        := io.brupdate.b2.taken
+      // A fused bms_mode branch never mispredicts, so a mispredict redirect
+      // makes some *other* CFI this entry's CFI: drop the fused marker.
+      redirect_new_entry.cfi_is_bms_fused := false.B
       redirect_new_entry.cfi_is_call      := redirect_entry.cfi_is_call && redirect_entry.cfi_idx.bits === new_cfi_idx
       redirect_new_entry.cfi_is_ret       := redirect_entry.cfi_is_ret  && redirect_entry.cfi_idx.bits === new_cfi_idx
     }

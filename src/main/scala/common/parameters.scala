@@ -45,6 +45,12 @@ case class BoomCoreParams(
   enableSFBOpt: Boolean = false,
   enableGHistStallRepair: Boolean = true,
   enableBTBFastRepair: Boolean = true,
+  // Alternative 1b: macro-op fusion of an adjacent BMS + conditional-branch
+  // pair into a single branch uop (see alternative-impls/alt1-fused-branch-
+  // variants.md §3/§4). Elaborates the fusion datapath next to the legacy
+  // BMS/BJR path; a runtime plusarg (+bms_fusion_enable=0) falls back to the
+  // legacy behavior. Default false => bit-identical to the pre-1b design.
+  enableBmsFusion: Boolean = false,
   useAtomicsOnlyForIO: Boolean = false,
   ftq: FtqParameters = FtqParameters(),
   intToFpLatency: Int = 2,
@@ -268,6 +274,7 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val enableSFBOpt = boomParams.enableSFBOpt
   val enableGHistStallRepair = boomParams.enableGHistStallRepair
   val enableBTBFastRepair = boomParams.enableBTBFastRepair
+  val enableBmsFusion = boomParams.enableBmsFusion
 
   //************************************
   // Implicitly calculated constants

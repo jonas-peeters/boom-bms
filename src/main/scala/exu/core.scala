@@ -222,6 +222,19 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   }
   io.ifu.bjrinfos := bjrinfos
 
+  // Alternative 1b: report resolutions of fused bms_mode branches to the
+  // FTQ so the main BPD trains on the would-be outcome through its normal
+  // update path (replaces BJR retro-training for fused pairs).
+  for (i <- 0 until coreWidth) {
+    val b = brinfos(i)
+    io.ifu.bms_resolves(i).valid := enableBmsFusion.B && b.valid &&
+      b.cfi_type === CFI_BR && b.uop.bms_mode &&
+      !rob.io.flush.valid && !IsKilledByBranch(brupdate, b.uop)
+    io.ifu.bms_resolves(i).bits.ftq_idx := b.uop.ftq_idx
+    io.ifu.bms_resolves(i).bits.taken := b.taken
+    io.ifu.bms_resolves(i).bits.mispredicted := b.uop.bms_bpd_taken =/= b.taken
+  }
+
   b1.resolve_mask := brinfos.map(x => x.valid << x.uop.br_tag).reduce(_|_)
   b1.mispredict_mask := brinfos.map(x => (x.valid && x.mispredict) << x.uop.br_tag).reduce(_|_)
 
