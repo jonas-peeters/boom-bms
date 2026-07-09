@@ -725,10 +725,14 @@ class BoomFrontendModule(outer: BoomFrontend)
   icache.io.s1_kill := tlb.io.resp.miss || f1_clear
 
   val f1_mask = fetchMask(s1_vpc)
+  // is_bms_redirect (alternative 1b): a fused branch running in branch-free
+  // mode redirects to its stored target (the branch-free block) regardless
+  // of the predicted direction, like a JAL.
   val f1_redirects = (0 until fetchWidth) map { i =>
     s1_valid && f1_mask(i) && s1_bpd_resp.preds(i).predicted_pc.valid &&
     (s1_bpd_resp.preds(i).is_jal ||
-      (s1_bpd_resp.preds(i).is_br && s1_bpd_resp.preds(i).taken))
+      (s1_bpd_resp.preds(i).is_br && (s1_bpd_resp.preds(i).taken ||
+        s1_bpd_resp.preds(i).is_bms_redirect)))
   }
   val f1_redirect_idx = PriorityEncoder(f1_redirects)
   val f1_do_redirect = f1_redirects.reduce(_ || _) && useBPD.B
@@ -740,7 +744,10 @@ class BoomFrontendModule(outer: BoomFrontend)
     s1_bpd_resp.preds
       .map(p => p.is_br && p.predicted_pc.valid)
       .asUInt & f1_mask,
-    s1_bpd_resp.preds(f1_redirect_idx).taken && f1_do_redirect,
+    // A bms redirect is a taken conditional-branch CFI in ghist, matching
+    // the F3 fused-redirect convention.
+    (s1_bpd_resp.preds(f1_redirect_idx).taken ||
+      s1_bpd_resp.preds(f1_redirect_idx).is_bms_redirect) && f1_do_redirect,
     s1_bpd_resp.preds(f1_redirect_idx).is_br,
     f1_redirect_idx,
     f1_do_redirect,
@@ -789,7 +796,8 @@ class BoomFrontendModule(outer: BoomFrontend)
   val f2_redirects = (0 until fetchWidth) map { i =>
     s2_valid && f2_mask(i) && f2_bpd_resp.preds(i).predicted_pc.valid &&
     (f2_bpd_resp.preds(i).is_jal ||
-      (f2_bpd_resp.preds(i).is_br && f2_bpd_resp.preds(i).taken))
+      (f2_bpd_resp.preds(i).is_br && (f2_bpd_resp.preds(i).taken ||
+        f2_bpd_resp.preds(i).is_bms_redirect)))
   }
   val f2_redirect_idx = PriorityEncoder(f2_redirects)
   val f2_targs = f2_bpd_resp.preds.map(_.predicted_pc.bits)
@@ -800,7 +808,8 @@ class BoomFrontendModule(outer: BoomFrontend)
     f2_bpd_resp.preds
       .map(p => p.is_br && p.predicted_pc.valid)
       .asUInt & f2_mask,
-    f2_bpd_resp.preds(f2_redirect_idx).taken && f2_do_redirect,
+    (f2_bpd_resp.preds(f2_redirect_idx).taken ||
+      f2_bpd_resp.preds(f2_redirect_idx).is_bms_redirect) && f2_do_redirect,
     f2_bpd_resp.preds(f2_redirect_idx).is_br,
     f2_redirect_idx,
     f2_do_redirect,
@@ -1441,6 +1450,7 @@ class BoomFrontendModule(outer: BoomFrontend)
   f4_btb_corrections.io.enq.bits := DontCare
   f4_btb_corrections.io.enq.bits.is_mispredict_update := false.B
   f4_btb_corrections.io.enq.bits.is_repair_update := false.B
+  f4_btb_corrections.io.enq.bits.cfi_is_bms_fused := false.B
   f4_btb_corrections.io.enq.bits.btb_mispredicts := f3_btb_mispredicts.asUInt
   f4_btb_corrections.io.enq.bits.pc := f3_fetch_bundle.pc
   f4_btb_corrections.io.enq.bits.ghist := f3_fetch_bundle.ghist
@@ -1532,6 +1542,9 @@ class BoomFrontendModule(outer: BoomFrontend)
   val bjr_bpd_update = Wire(Valid(new BranchPredictionUpdate))
   bjr_bpd_update.valid := false.B
   bjr_bpd_update.bits := DontCare
+  // Legacy BJR retro-updates never describe fused CFIs; keep the flag off so
+  // the retro predictor's BTBs never allocate always-redirecting entries.
+  bjr_bpd_update.bits.cfi_is_bms_fused := false.B
   
   for (i <- 0 until coreWidth) {
     bmh.io.updates(i + coreWidth) := DontCare

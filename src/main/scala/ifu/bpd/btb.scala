@@ -41,9 +41,13 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
 
   class BTBMeta extends Bundle {
     val is_br = Bool()
+    // BMS fusion (alternative 1b): this branch currently runs in branch-free
+    // mode; the stored offset points at the branch-free block and fetch must
+    // redirect there regardless of the predicted direction.
+    val is_bms = Bool()
     val tag   = UInt(tagSz.W)
   }
-  val btbMetaSz = tagSz + 1
+  val btbMetaSz = tagSz + 2
 
   class BTBPredictMeta extends Bundle {
     val write_way = UInt(log2Ceil(nWays).W)
@@ -78,6 +82,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   val s1_resp   = Wire(Vec(bankWidth, Valid(UInt(vaddrBitsExtended.W))))
   val s1_is_br  = Wire(Vec(bankWidth, Bool()))
   val s1_is_jal = Wire(Vec(bankWidth, Bool()))
+  val s1_is_bms = Wire(Vec(bankWidth, Bool()))
 
   val s1_hit_ohs = VecInit((0 until bankWidth) map { i =>
     VecInit((0 until nWays) map { w =>
@@ -97,6 +102,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       (s1_pc.asSInt + (w << 1).S + entry_btb.offset).asUInt)
     s1_is_br(w)  := !doing_reset && s1_resp(w).valid &&  entry_meta.is_br
     s1_is_jal(w) := !doing_reset && s1_resp(w).valid && !entry_meta.is_br
+    s1_is_bms(w) := !doing_reset && s1_resp(w).valid &&  entry_meta.is_bms
 
 
     io.resp.f2(w) := io.resp_in(0).f2(w)
@@ -105,6 +111,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       io.resp.f2(w).predicted_pc := RegNext(s1_resp(w))
       io.resp.f2(w).is_br        := RegNext(s1_is_br(w))
       io.resp.f2(w).is_jal       := RegNext(s1_is_jal(w))
+      io.resp.f2(w).is_bms_redirect := RegNext(s1_is_bms(w))
       when (RegNext(s1_is_jal(w))) {
         io.resp.f2(w).taken      := true.B
       }
@@ -113,6 +120,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       io.resp.f3(w).predicted_pc := RegNext(io.resp.f2(w).predicted_pc)
       io.resp.f3(w).is_br        := RegNext(io.resp.f2(w).is_br)
       io.resp.f3(w).is_jal       := RegNext(io.resp.f2(w).is_jal)
+      io.resp.f3(w).is_bms_redirect := RegNext(io.resp.f2(w).is_bms_redirect)
       when (RegNext(RegNext(s1_is_jal(w)))) {
         io.resp.f3(w).taken      := true.B
       }
@@ -148,8 +156,12 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   val s1_update_wbtb_data  = Wire(new BTBEntry)
   s1_update_wbtb_data.extended := offset_is_extended
   s1_update_wbtb_data.offset   := new_offset_value
+  // A fused bms_mode CFI (alternative 1b) allocates even when its would-be
+  // direction is not-taken: fetch always redirected to the branch-free
+  // block, and that fetch target is what `target` carries for such updates.
   val s1_update_wbtb_mask = (UIntToOH(s1_update_cfi_idx) &
-    Fill(bankWidth, s1_update.bits.cfi_idx.valid && s1_update.valid && s1_update.bits.cfi_taken && s1_update.bits.is_commit_update))
+    Fill(bankWidth, s1_update.bits.cfi_idx.valid && s1_update.valid &&
+      (s1_update.bits.cfi_taken || s1_update.bits.cfi_is_bms_fused) && s1_update.bits.is_commit_update))
 
   val s1_update_wmeta_mask = ((s1_update_wbtb_mask | s1_update.bits.br_mask) &
     (Fill(bankWidth, s1_update.valid && s1_update.bits.is_commit_update) |
@@ -161,6 +173,11 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   for (w <- 0 until bankWidth) {
     s1_update_wmeta_data(w).tag     := Mux(s1_update.bits.btb_mispredicts(w), 0.U, s1_update_idx >> log2Ceil(nSets))
     s1_update_wmeta_data(w).is_br   := s1_update.bits.br_mask(w)
+    // Set on the fused CFI slot while in branch-free mode; commit updates
+    // from branchy-mode packets clear it again (self-healing on mode flips).
+    s1_update_wmeta_data(w).is_bms  := s1_update.bits.cfi_is_bms_fused &&
+      s1_update.bits.cfi_idx.valid && s1_update_cfi_idx === w.U &&
+      !s1_update.bits.btb_mispredicts(w)
   }
 
   for (w <- 0 until nWays) {

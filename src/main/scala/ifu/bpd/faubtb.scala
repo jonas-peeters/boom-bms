@@ -41,6 +41,11 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
 
   class MicroBTBMeta extends Bundle {
     val is_br = Bool()
+    // BMS fusion (alternative 1b): this branch currently runs in branch-free
+    // mode; the stored offset points at the branch-free block and fetch must
+    // redirect there regardless of ctr. ctr keeps tracking the would-be
+    // direction of the architectural branch.
+    val is_bms = Bool()
     val tag   = UInt(tagSz.W)
     val ctr   = UInt(2.W)
   }
@@ -66,6 +71,7 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
   val s1_taken  = Wire(Vec(bankWidth, Bool()))
   val s1_is_br  = Wire(Vec(bankWidth, Bool()))
   val s1_is_jal = Wire(Vec(bankWidth, Bool()))
+  val s1_is_bms = Wire(Vec(bankWidth, Bool()))
 
   val s1_hit_ohs = VecInit((0 until bankWidth) map { i =>
     VecInit((0 until nWays) map { w =>
@@ -81,6 +87,7 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
     s1_resp(w).bits  := (s1_pc.asSInt + (w << 1).S + btb(s1_hit_ways(w))(w).offset).asUInt
     s1_is_br(w)      := s1_resp(w).valid &&  entry_meta.is_br
     s1_is_jal(w)     := s1_resp(w).valid && !entry_meta.is_br
+    s1_is_bms(w)     := s1_resp(w).valid &&  entry_meta.is_bms
     s1_taken(w)      := !entry_meta.is_br || entry_meta.ctr(1)
 
     s1_meta.hits(w)     := s1_hits(w)
@@ -102,6 +109,7 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
     io.resp.f1(w).predicted_pc := s1_resp(w)
     io.resp.f1(w).is_br        := s1_is_br(w)
     io.resp.f1(w).is_jal       := s1_is_jal(w)
+    io.resp.f1(w).is_bms_redirect := s1_is_bms(w)
     io.resp.f1(w).taken        := s1_taken(w)
 
     io.resp.f2(w) := RegNext(io.resp.f1(w))
@@ -126,8 +134,12 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
   val s1_update_wmeta_mask = ((s1_update_wbtb_mask | s1_update.bits.br_mask) &
     Fill(bankWidth, s1_update.valid && s1_update.bits.is_commit_update))
 
-  // Write the BTB with the target
-  when (s1_update.valid && s1_update.bits.cfi_taken && s1_update.bits.cfi_idx.valid && s1_update.bits.is_commit_update) {
+  // Write the BTB with the target. A fused bms_mode CFI (alternative 1b)
+  // allocates even when its would-be direction is not-taken: fetch always
+  // redirected to the branch-free block, and that fetch target is what
+  // `target` carries for such updates.
+  when (s1_update.valid && (s1_update.bits.cfi_taken || s1_update.bits.cfi_is_bms_fused) &&
+    s1_update.bits.cfi_idx.valid && s1_update.bits.is_commit_update) {
     btb(s1_update_write_way)(s1_update_cfi_idx).offset := new_offset_value
   }
 
@@ -135,11 +147,16 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
   for (w <- 0 until bankWidth) {
     when (s1_update.valid && s1_update.bits.is_commit_update &&
       (s1_update.bits.br_mask(w) ||
-        (s1_update_cfi_idx === w.U && s1_update.bits.cfi_taken && s1_update.bits.cfi_idx.valid))) {
+        (s1_update_cfi_idx === w.U && (s1_update.bits.cfi_taken || s1_update.bits.cfi_is_bms_fused) && s1_update.bits.cfi_idx.valid))) {
+      // The would-be direction, for fused CFIs: cfi_taken already carries
+      // the would-be outcome, so the ctr keeps learning the architectural
+      // branch even while fetch unconditionally redirects.
       val was_taken = (s1_update_cfi_idx === w.U && s1_update.bits.cfi_idx.valid &&
         (s1_update.bits.cfi_taken || s1_update.bits.cfi_is_jal))
 
       meta(s1_update_write_way)(w).is_br := s1_update.bits.br_mask(w)
+      meta(s1_update_write_way)(w).is_bms := s1_update.bits.cfi_is_bms_fused &&
+        s1_update.bits.cfi_idx.valid && s1_update_cfi_idx === w.U
       meta(s1_update_write_way)(w).tag   := s1_update_idx
       meta(s1_update_write_way)(w).ctr   := Mux(!s1_update_meta.hits(w),
         Mux(was_taken, 3.U, 0.U),

@@ -23,6 +23,13 @@ class BranchPrediction(implicit p: Parameters) extends BoomBundle()(p)
   val is_br           = Bool()
   // Is this a JAL?
   val is_jal          = Bool()
+  // BMS fusion (alternative 1b): the BTB remembers that this branch is
+  // currently running in branch-free mode, so fetch must redirect to
+  // predicted_pc (the branch-free block) regardless of the predicted
+  // direction. `taken` keeps carrying the would-be direction of the
+  // architectural branch (the direction predictors keep training on the
+  // would-be outcome), which the BMH training path still needs.
+  val is_bms_redirect = Bool()
   // What is the target of his branch/jump? Do we know the target?
   val predicted_pc    = Valid(UInt(vaddrBitsExtended.W))
 
@@ -72,6 +79,12 @@ class BranchPredictionUpdate(implicit p: Parameters) extends BoomBundle()(p)
   // Was the cfi a jalr
   val cfi_is_jalr = Bool()
   //val cfi_is_ret  = Bool()
+  // Was the cfi a fused bms_mode branch running in branch-free mode
+  // (alternative 1b)? If so, `target` is the fetch target (the branch-free
+  // block) and BTB-like predictors should allocate an always-redirecting
+  // entry for it, while `cfi_taken`/`cfi_mispredicted` carry the would-be
+  // outcome for the direction predictors.
+  val cfi_is_bms_fused = Bool()
 
   val ghist = new GlobalHistory
   val lhist = Vec(nBanks, UInt(localHistoryLength.W))
@@ -105,6 +118,7 @@ class BranchPredictionBankUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val cfi_is_br        = Bool()
   val cfi_is_jal       = Bool()
   val cfi_is_jalr      = Bool()
+  val cfi_is_bms_fused = Bool()
 
   val ghist            = UInt(globalHistoryLength.W)
   val lhist            = UInt(localHistoryLength.W)
@@ -420,6 +434,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(i).io.update.bits.cfi_is_br        := io.update.bits.cfi_is_br
     banked_predictors(i).io.update.bits.cfi_is_jal       := io.update.bits.cfi_is_jal
     banked_predictors(i).io.update.bits.cfi_is_jalr      := io.update.bits.cfi_is_jalr
+    banked_predictors(i).io.update.bits.cfi_is_bms_fused := io.update.bits.cfi_is_bms_fused
     banked_predictors(i).io.update.bits.target           := io.update.bits.target
 
     banked_lhist_providers(i).io.update.mispredict := io.update.bits.is_mispredict_update

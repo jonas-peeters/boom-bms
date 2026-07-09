@@ -321,17 +321,20 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.br_mask := Mux(bpd_entry.cfi_idx.valid,
       MaskLower(UIntToOH(cfi_idx)) & bpd_entry.br_mask, bpd_entry.br_mask)
     io.bpdupdate.bits.cfi_idx := bpd_entry.cfi_idx
-    // For fused bms_mode branches (alternative 1b), train with the
-    // would-be outcome and the architectural branch target instead of the
-    // recorded prediction (which is "taken -> branch-free target"). The
-    // ghist snapshot deliberately keeps the fetch-time taken bit: the
-    // update trains against the history the predictor actually saw.
+    // For fused bms_mode branches (alternative 1b), train the direction
+    // predictors with the would-be outcome (cfi_taken/cfi_mispredicted)
+    // while `target` keeps the fetch target — the branch-free block — so
+    // BTB-like predictors learn to redirect at F1/F2 instead of costing a
+    // full F3 redirect every iteration (cfi_is_bms_fused marks the entry
+    // as always-redirecting for them). The ghist snapshot deliberately
+    // keeps the fetch-time taken bit: the update trains against the
+    // history the predictor actually saw.
     io.bpdupdate.bits.cfi_mispredicted := Mux(bpd_entry.cfi_is_bms_fused,
       bpd_bms_mispred, bpd_entry.cfi_mispredicted)
     io.bpdupdate.bits.cfi_taken  := Mux(bpd_entry.cfi_is_bms_fused,
       bpd_bms_taken, bpd_entry.cfi_taken)
-    io.bpdupdate.bits.target     := Mux(bpd_entry.cfi_is_bms_fused,
-      bpd_bms_target, bpd_target)
+    io.bpdupdate.bits.target     := bpd_target
+    io.bpdupdate.bits.cfi_is_bms_fused := bpd_entry.cfi_is_bms_fused
     io.bpdupdate.bits.cfi_is_br  := bpd_entry.br_mask(cfi_idx)
     io.bpdupdate.bits.cfi_is_jal := bpd_entry.cfi_type === CFI_JAL || bpd_entry.cfi_type === CFI_JALR
     io.bpdupdate.bits.ghist      := bpd_ghist
