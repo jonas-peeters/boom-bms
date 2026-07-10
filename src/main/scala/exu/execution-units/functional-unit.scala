@@ -499,35 +499,30 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
 
   io.brinfo := brinfo
 
+  // --- BranchMissHistory training (runs on EVERY ALU, not just the jmp unit) ---
+  // fix-07 Defect A: conditional branches issue to any integer ALU, but this
+  // update used to live in the `isJmpUnit` block, so on multi-ALU configs
+  // (Medium/Large/Mega) branches resolving on other ALUs never trained the BMH
+  // — the misprediction rate the BMS decision reads was a load-dependent
+  // subsample. It lived there only because the update PC was reconstructed from
+  // `get_ftq_pc`, a read port that only the jmp unit has. The PC is instead
+  // taken from `uop.debug_pc`, carried by every uop on every ALU (the same
+  // source fix-13 uses for the fused branch), so the update is correct on any
+  // unit and needs no `get_ftq_pc`.
+  //   - valid on real conditional branches only: not JALR (target mispredicts
+  //     are a different phenomenon), not BMS itself (never mispredicts, would
+  //     only burn a table slot next to the branch it guards).
+  //   - for a fused bms_mode branch the architectural mispredict is forced
+  //     false, so train with the would-be direction mispredict (BPD fetch-time
+  //     prediction vs. the evaluated condition) instead. (fix-13: debug_pc also
+  //     avoids the stale-get_ftq_pc wrong-entry bug that froze switch-back.)
+  io.bmhu.valid := is_br && uop.inst =/= BMS
+  io.bmhu.bits.mispredict := Mux(is_bms_fused,
+    uop.bms_bpd_taken =/= (pc_sel === PC_BRJMP), brinfo.mispredict)
+  io.bmhu.bits.pc := uop.debug_pc
+  io.bmhu.bits.br_mask := GetNewBrMask(io.brupdate, uop)
+
   if (isJmpUnit) {
-    val block_pc = AlignPCToBoundary(io.get_ftq_pc.pc, icBlockBytes)
-    val uop_pc = (block_pc | uop.pc_lob) - Mux(uop.edge_inst, 2.U, 0.U)
-    
-    // Train the miss history only on real conditional branches:
-    //  - not JALR (target mispredicts are a different phenomenon),
-    //  - not BMS itself (never mispredicts by construction; would only
-    //    burn a table slot next to the branch it guards).
-    io.bmhu.valid := is_br && uop.inst =/= BMS
-    // For fused bms_mode branches the architectural mispredict is forced
-    // false; train the BMH with the would-be direction mispredict instead
-    // (the BPD's fetch-time prediction vs. the evaluated condition).
-    io.bmhu.bits.mispredict := Mux(is_bms_fused,
-      uop.bms_bpd_taken =/= (pc_sel === PC_BRJMP), brinfo.mispredict)
-    io.bmhu.bits.pc := uop_pc
-    io.bmhu.bits.br_mask := GetNewBrMask(io.brupdate, uop)
-    //val uop_pc_next = RegNext(uop_pc)
-    //val uop_pc_next_next = RegNext(RegNext(uop_pc))
-    //val uop_pc_next_next_next = RegNext(RegNext(RegNext(uop_pc)))
-    //when (brinfo.valid) {
-    //  printf("Setting bmhu.valid\n")
-    //  printf("  mispredict: %b\n", brinfo.mispredict)
-    //  printf("  uop_pc: 0x%x\n", uop_pc)
-    //  printf("  uop_pc_next: 0x%x\n", uop_pc_next)
-    //  printf("  uop_pc_next_next: 0x%x\n", uop_pc_next_next)
-    //  printf("  uop_pc_next_next_next: 0x%x\n", uop_pc_next_next_next)
-    //}
-
-
     val bjrinfo = Wire(new BjrInfo)
     bjrinfo.valid := is_bjr
     bjrinfo.taken := bjr_taken
