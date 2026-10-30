@@ -291,13 +291,21 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       ("nop",       () => false.B))),
 
     new freechips.rocketchip.rocket.EventSet((mask, hits) => (mask & hits).orR, Seq(
-//      ("I$ blocked",                        () => icache_blocked),
-      ("nop",                               () => false.B),
-      // ("branch misprediction",              () => br_unit.brinfo.mispredict),
-      // ("control-flow target misprediction", () => br_unit.brinfo.mispredict &&
-      //                                             br_unit.brinfo.cfi_type === CFI_JALR),
-      ("flush",                             () => rob.io.flush.valid)
-      //("branch resolved",                   () => br_unit.brinfo.valid)
+      // idx 0 -> mhpmevent selector 0x101: redirecting conditional-branch
+      // mispredictions. brupdate.b2 carries the single oldest redirect each
+      // cycle; gating CFI_BR excludes JALR target misses so this numerator
+      // describes the same conditional branches as selector 0x401.
+      ("conditional branch misprediction",  () => brupdate.b2.mispredict &&
+                                                   brupdate.b2.cfi_type === CFI_BR),
+      // idx 1 -> selector 0x201: pipeline flushes (kept from before).
+      ("flush",                             () => rob.io.flush.valid),
+      // idx 2 -> selector 0x401: committed conditional branches. The scalar
+      // event value is used for event decoding; the counter input below
+      // substitutes the exact retirement-lane PopCount for this selector.
+      ("branches retired",                  () => VecInit((0 until coreWidth) map { i =>
+                                                    rob.io.commit.arch_valids(i) &&
+                                                    rob.io.commit.uops(i).is_br
+                                                  }).asUInt.orR)
     )),
 
     new freechips.rocketchip.rocket.EventSet((mask, hits) => (mask & hits).orR, Seq(
@@ -318,7 +326,18 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B
-  csr.io.counters foreach { c => c.inc := RegNext(perfEvents.evaluate(c.eventSel)) }
+  val retiredBranchCount = PopCount(VecInit((0 until coreWidth) map { i =>
+    rob.io.commit.arch_valids(i) && rob.io.commit.uops(i).is_br
+  }))
+  val retiredBranchEvent = 0x401.U
+  csr.io.counters foreach { c =>
+    // EventSets.evaluate is Boolean, but PerfCounterIO.inc is deliberately
+    // wide enough for one increment per retirement lane. Preserve the normal
+    // scalar-event behavior for every selector except 0x401, whose increment
+    // must include all conditional branches retiring in the same cycle.
+    c.inc := RegNext(Mux(c.eventSel === retiredBranchEvent,
+      retiredBranchCount, perfEvents.evaluate(c.eventSel)))
+  }
 
   //****************************************
   // Time Stamp Counter & Retired Instruction Counter
