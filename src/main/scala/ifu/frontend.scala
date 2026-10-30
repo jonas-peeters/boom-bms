@@ -352,7 +352,7 @@ class BranchMissHistory(implicit p: Parameters)
     with HasBoomFrontendParameters {
   // Number of different branches to track
   // Must be a power of 2
-  var tableSize = 128
+  var tableSize = 64
 
   val io = IO(new Bundle {
     val updates = Input(Vec(coreWidth * 2, Valid(new BranchMissHistoryUpdate)))
